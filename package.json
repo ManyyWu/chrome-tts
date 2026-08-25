@@ -1,0 +1,15 @@
+{
+  "name": "chrome-tts",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/popup.ts --bundle --format=iife --target=chrome120 --outfile=dist/popup.js",
+    "check": "tsc --noEmit",
+    "watch": "esbuild src/popup.ts --bundle --format=iife --target=chrome120 --outfile=dist/popup.js --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.36",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.9.2"
+  }
+}
