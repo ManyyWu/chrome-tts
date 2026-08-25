@@ -60,7 +60,7 @@ function publishState(state: PlaybackState): void {
   }
 }
 
-/** 位置事件仅属于当前页面播放，不广播给 popup 或其他标签。 */
+/** 位置事件仅属于当前页面播放，不广播给设置页或其他标签。 */
 function publishPosition(position: PlaybackPosition): void {
   const targetTabId = activePlaybackTabId;
   if (targetTabId === null) {
@@ -216,13 +216,6 @@ async function handleRequest(
             ? player.getState()
             : getStateForTab(sender.tab.id),
       };
-    case "settings:open":
-      await chrome.action.openPopup(
-        sender.tab?.windowId === undefined
-          ? undefined
-          : { windowId: sender.tab.windowId },
-      );
-      return { ok: true, state: player.getState() };
     case "test:trigger-error":
       await sendTestError();
       return { ok: true, state: player.getState() };

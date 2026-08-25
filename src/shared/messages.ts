@@ -5,7 +5,7 @@ import type {
   PlaybackState,
 } from "./models";
 
-/** popup 和后续 content script 可以发送给 service worker 的播放器命令。 */
+/** 设置页和 content script 可以发送给 service worker 的播放器命令。 */
 export type ExtensionRequest =
   | { type: "page:set-items"; items: PageTextItem[] }
   | { type: "page:toggle" }
@@ -16,7 +16,6 @@ export type ExtensionRequest =
   | { type: "selection:auto-play"; text: string }
   | { type: "player:stop" }
   | { type: "player:get-state" }
-  | { type: "settings:open" }
   | { type: "test:trigger-error" };
 
 /** service worker 主动发送给已打开界面的状态事件。 */
@@ -81,7 +80,6 @@ export function isExtensionRequest(value: unknown): value is ExtensionRequest {
     type === "page:next" ||
     type === "player:stop" ||
     type === "player:get-state" ||
-    type === "settings:open" ||
     type === "test:trigger-error"
   );
 }

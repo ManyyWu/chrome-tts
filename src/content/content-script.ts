@@ -133,11 +133,6 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     onVolumeChange(volume) {
       void saveSettings({ volume });
     },
-    onOpenSettings() {
-      void sendRequest({ type: "settings:open" }).catch((error: unknown) => {
-        showError(createContentError("OPEN_SETTINGS_FAILED", error));
-      });
-    },
   });
 
   /** 统一渲染同步响应；异步 TTS 事件随后由 onMessage 继续更新。 */

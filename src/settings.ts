@@ -7,7 +7,7 @@ import {
   updateSettings,
 } from "./shared/settings";
 
-/** popup 必需元素缺失时立即抛错，防止 HTML 与脚本结构悄悄失配。 */
+/** 通用设置页必需元素缺失时立即抛错，防止 HTML 与脚本结构悄悄失配。 */
 function requireElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) {
@@ -30,7 +30,7 @@ const showSelectionJumpPromptInput = requireElement<HTMLInputElement>(
 const playAllVisibleTextInput = requireElement<HTMLInputElement>(
   "#play-all-visible-text",
 );
-const errorElement = requireElement<HTMLDivElement>("#popup-error");
+const errorElement = requireElement<HTMLDivElement>("#settings-error");
 const testActions = requireElement<HTMLDivElement>("#test-actions");
 
 let voices: chrome.tts.TtsVoice[] = [];
@@ -173,7 +173,7 @@ globalEnabledInput.addEventListener("change", () => {
   );
 });
 
-/** popup 自身错误只在实际发生时显示，不保留常驻 statusElement。 */
+/** 设置页自身错误只在实际发生时显示，不保留常驻 statusElement。 */
 function showPopupError(error: unknown): void {
   errorElement.textContent = error instanceof Error ? error.message : String(error);
   errorElement.hidden = false;

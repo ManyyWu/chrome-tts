@@ -23,7 +23,6 @@ export interface FloatingControlBarActions {
   onPlayText(text: string): void;
   onRateChange(rate: number): void;
   onVolumeChange(volume: number): void;
-  onOpenSettings(): void;
 }
 
 /**
@@ -47,6 +46,7 @@ export class FloatingControlBar {
   private readonly volumePanel: HTMLDivElement;
   private readonly volumeInput: HTMLInputElement;
   private readonly volumeValue: HTMLOutputElement;
+  private readonly settingsOverlayHost: HTMLDivElement;
   private currentRate = 1;
   private hasPageItems = false;
   private isLoading = false;
@@ -88,7 +88,7 @@ export class FloatingControlBar {
     textButton.addEventListener("click", () => this.toggleInputPanel());
     rateButton.addEventListener("click", () => this.toggleRatePanel());
     volumeButton.addEventListener("click", () => this.toggleVolumePanel());
-    settingsButton.addEventListener("click", actions.onOpenSettings);
+    settingsButton.addEventListener("click", () => this.openSettingsPanel());
     collapseButton.addEventListener("click", () => this.collapse());
     this.initializeDragging(dragButton);
 
@@ -211,6 +211,8 @@ export class FloatingControlBar {
     });
     this.volumePanel.append(this.volumeInput, this.volumeValue);
 
+    this.settingsOverlayHost = this.createSettingsOverlay();
+
     shadowRoot.append(
       this.controlBarElement,
       this.inputPanel,
@@ -219,6 +221,7 @@ export class FloatingControlBar {
     );
     document.documentElement.append(this.host);
     document.documentElement.append(this.launcherHost);
+    document.documentElement.append(this.settingsOverlayHost);
 
     // 拖动后使用固定 left/top；视口缩小时重新约束，避免控制栏留在不可见区域。
     const handleViewportResize = (): void => {
@@ -459,6 +462,117 @@ export class FloatingControlBar {
     this.inputPanel.hidden = true;
     this.ratePanel.hidden = true;
     this.volumePanel.hidden = true;
+    this.settingsOverlayHost.hidden = true;
+  }
+
+  /** 在网页上方打开通用设置页，绕过 Edge Android 不可用的 action.openPopup。 */
+  private openSettingsPanel(): void {
+    this.inputPanel.hidden = true;
+    this.ratePanel.hidden = true;
+    this.volumePanel.hidden = true;
+    this.settingsOverlayHost.hidden = false;
+  }
+
+  /**
+   * 用独立 Shadow DOM 承载设置页，避免网页样式污染，同时让桌面 popup 与移动端
+   * 浮动面板复用同一个 settings.html 和 settings.ts。
+   */
+  private createSettingsOverlay(): HTMLDivElement {
+    const overlayHost = document.createElement("div");
+    overlayHost.id = "chrome-tts-settings-overlay";
+    overlayHost.hidden = true;
+    const shadowRoot = overlayHost.attachShadow({ mode: "closed" });
+
+    const style = document.createElement("style");
+    style.textContent = `
+      :host {
+        all: initial;
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: grid;
+        place-items: center;
+        padding: 16px;
+        box-sizing: border-box;
+        background: rgb(0 0 0 / 35%);
+        color-scheme: light;
+      }
+
+      :host([hidden]) {
+        display: none;
+      }
+
+      .dialog {
+        position: relative;
+        width: min(380px, calc(100vw - 32px));
+        height: min(620px, calc(100vh - 32px));
+        overflow: hidden;
+        border: 1px solid rgb(0 0 0 / 15%);
+        border-radius: 14px;
+        background: #fff;
+        box-shadow: 0 12px 38px rgb(0 0 0 / 28%);
+      }
+
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #fff;
+      }
+
+      button {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1;
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        border: 0;
+        border-radius: 8px;
+        color: #3c4043;
+        background: #f1f3f4;
+        cursor: pointer;
+        font: 22px/1 sans-serif;
+      }
+
+      button:focus-visible {
+        outline: 2px solid #1a73e8;
+        outline-offset: 2px;
+      }
+    `;
+
+    const dialog = document.createElement("div");
+    dialog.className = "dialog";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-label", "Chrome TTS 设置");
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.textContent = "×";
+    closeButton.title = "关闭设置";
+    closeButton.setAttribute("aria-label", "关闭设置");
+    closeButton.addEventListener("click", () => {
+      overlayHost.hidden = true;
+    });
+
+    const frame = document.createElement("iframe");
+    frame.src = chrome.runtime.getURL("settings.html?embedded=1");
+    frame.title = "Chrome TTS 设置";
+
+    dialog.append(closeButton, frame);
+    shadowRoot.append(style, dialog);
+    overlayHost.addEventListener("pointerdown", (event) => {
+      if (event.composedPath().includes(dialog)) {
+        return;
+      }
+      overlayHost.hidden = true;
+    });
+    return overlayHost;
   }
 
   /** 将微调结果限制在 0.5–1.5，并消除小数累加产生的浮点误差。 */

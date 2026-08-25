@@ -21,7 +21,7 @@ export interface SpeechSnapshot {
 /**
  * 集中管理 chrome.tts 和播放器状态。
  *
- * popup 只发送命令，不直接调用 TTS，因此 popup 关闭后不会丢失本次话语的事件回调。
+ * 设置页只发送命令，不直接调用 TTS，因此设置面板关闭后不会丢失话语事件回调。
  * playbackToken 会使旧话语迟到的事件失效，避免新播放被旧的 interrupted 或 end 覆盖。
  */
 export class TtsPlayer {
