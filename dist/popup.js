@@ -6,12 +6,14 @@
   // src/shared/settings.ts
   var SETTINGS_KEY = "extensionSettings";
   var DEFAULT_SETTINGS = {
-    version: 1,
+    version: 3,
     voiceName: null,
     voiceExtensionId: null,
     lang: null,
     rate: 1,
-    volume: 1
+    volume: 1,
+    autoPlaySelection: false,
+    showSelectionJumpPrompt: false
   };
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -27,12 +29,14 @@
     const rate = typeof stored.rate === "number" && Number.isFinite(stored.rate) ? clamp(Math.round(stored.rate * 10) / 10, 0.5, 1.5) : DEFAULT_SETTINGS.rate;
     const volume = typeof stored.volume === "number" && Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : DEFAULT_SETTINGS.volume;
     return {
-      version: 1,
+      version: 3,
       voiceName: isNullableString(stored.voiceName) ? stored.voiceName : DEFAULT_SETTINGS.voiceName,
       voiceExtensionId: isNullableString(stored.voiceExtensionId) ? stored.voiceExtensionId : DEFAULT_SETTINGS.voiceExtensionId,
       lang: isNullableString(stored.lang) ? stored.lang : DEFAULT_SETTINGS.lang,
       rate,
-      volume
+      volume,
+      autoPlaySelection: typeof stored.autoPlaySelection === "boolean" ? stored.autoPlaySelection : DEFAULT_SETTINGS.autoPlaySelection,
+      showSelectionJumpPrompt: typeof stored.showSelectionJumpPrompt === "boolean" ? stored.showSelectionJumpPrompt : DEFAULT_SETTINGS.showSelectionJumpPrompt
     };
   }
   async function loadSettings() {
@@ -46,7 +50,7 @@
   }
   async function updateSettings(changes) {
     const current = await loadSettings();
-    const settings = normalizeSettings({ ...current, ...changes, version: 1 });
+    const settings = normalizeSettings({ ...current, ...changes, version: 3 });
     await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
     return settings;
   }
@@ -64,6 +68,10 @@
   var rateValue = requireElement("#rate-value");
   var volumeInput = requireElement("#volume");
   var volumeValue = requireElement("#volume-value");
+  var autoPlaySelectionInput = requireElement("#auto-play-selection");
+  var showSelectionJumpPromptInput = requireElement(
+    "#show-selection-jump-prompt"
+  );
   var errorElement = requireElement("#popup-error");
   var testActions = requireElement("#test-actions");
   var voices = [];
@@ -150,6 +158,8 @@
     rateValue.textContent = `${formatRate(settings.rate)}\xD7`;
     volumeInput.value = String(settings.volume);
     volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
+    autoPlaySelectionInput.checked = settings.autoPlaySelection;
+    showSelectionJumpPromptInput.checked = settings.showSelectionJumpPrompt;
   }
   function showPopupError(error) {
     errorElement.textContent = error instanceof Error ? error.message : String(error);
@@ -176,6 +186,18 @@
   volumeInput.addEventListener("change", () => {
     clearPopupError();
     void updateSettings({ volume: Number(volumeInput.value) }).catch(showPopupError);
+  });
+  autoPlaySelectionInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({
+      autoPlaySelection: autoPlaySelectionInput.checked
+    }).catch(showPopupError);
+  });
+  showSelectionJumpPromptInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({
+      showSelectionJumpPrompt: showSelectionJumpPromptInput.checked
+    }).catch(showPopupError);
   });
   chrome.tts.onVoicesChanged.addListener(() => {
     void loadVoices().catch(showPopupError);

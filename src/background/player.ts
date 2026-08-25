@@ -1,11 +1,22 @@
-import type { ExtensionSettings, PlaybackState } from "../shared/models";
+import type {
+  ExtensionSettings,
+  PlaybackPosition,
+  PlaybackSource,
+  PlaybackState,
+} from "../shared/models";
 import { loadSettings } from "../shared/settings";
 
-/** 第一阶段使用固定内容验证完整播放链路，后续由网页适配器提供文本。 */
-export const DEMO_TEXT =
-  "你好，这是一段 Chrome TTS 固定测试文本。它用于验证播放、暂停、恢复和停止功能。";
-
 type StateListener = (state: PlaybackState) => void;
+type PositionListener = (position: PlaybackPosition) => void;
+
+/** 暂停恢复所需的最小话语快照；文本与索引都基于实际传给 chrome.tts 的字符串。 */
+export interface SpeechSnapshot {
+  text: string;
+  source: Exclude<PlaybackSource, null>;
+  itemId: string | null;
+  charIndex: number;
+  textOffset: number;
+}
 
 /**
  * 集中管理 chrome.tts 和播放器状态。
@@ -16,49 +27,68 @@ type StateListener = (state: PlaybackState) => void;
 export class TtsPlayer {
   private state: PlaybackState = {
     status: "idle",
+    source: null,
+    itemId: null,
     updatedAt: Date.now(),
   };
 
   private playbackToken = 0;
+  private currentSpeech: SpeechSnapshot | null = null;
 
-  public constructor(private readonly onStateChange: StateListener) {}
+  public constructor(
+    private readonly onStateChange: StateListener,
+    private readonly onPositionChange: PositionListener,
+  ) {}
 
   /** 返回不可被调用方修改的状态副本。 */
   public getState(): PlaybackState {
     return { ...this.state };
   }
 
-  /** 根据当前状态执行暂停、恢复或开始播放固定文本。 */
-  public async toggleDemo(): Promise<PlaybackState> {
-    // 设置仍在加载时尚无可暂停的话语；界面会临时禁用按钮，重复消息也安全忽略。
-    if (this.state.status === "loading") {
-      return this.getState();
-    }
+  /** 返回当前话语及最近的位置事件，用于原生暂停失效后的文本位置恢复。 */
+  public getSpeechSnapshot(): SpeechSnapshot | null {
+    return this.currentSpeech === null ? null : { ...this.currentSpeech };
+  }
 
+  /** 暂停当前话语；loading 状态尚未开始合成，因此保持不变。 */
+  public pause(): PlaybackState {
     if (this.state.status === "playing") {
       chrome.tts.pause();
       this.setState("paused");
-      return this.getState();
     }
+    return this.getState();
+  }
 
+  /** 恢复被暂停的话语。 */
+  public resume(): PlaybackState {
     if (this.state.status === "paused") {
       chrome.tts.resume();
       this.setState("playing");
-      return this.getState();
     }
-
-    return this.play(DEMO_TEXT);
+    return this.getState();
   }
 
-  /** 播放由兼容页面提供的非空文本，并中断此前的话语。 */
-  public async playText(text: string): Promise<PlaybackState> {
+  /** 播放标准化文本，并记录来源和可选页面条目 ID。 */
+  public async playText(
+    text: string,
+    source: Exclude<PlaybackSource, null>,
+    itemId: string | null = null,
+    textOffset = 0,
+  ): Promise<PlaybackState> {
     const normalizedText = text.trim();
     if (!normalizedText) {
       this.setState("error", "没有可播放的文本。");
       return this.getState();
     }
 
-    return this.play(normalizedText);
+    this.currentSpeech = {
+      text: normalizedText,
+      source,
+      itemId,
+      charIndex: 0,
+      textOffset,
+    };
+    return this.play(normalizedText, source, itemId);
   }
 
   /** 停止当前话语，并让旧话语的后续事件全部失效。 */
@@ -70,13 +100,23 @@ export class TtsPlayer {
   }
 
   /** 使用持久化声音参数开始一次独立话语。 */
-  private async play(text: string): Promise<PlaybackState> {
+  private async play(
+    text: string,
+    source: Exclude<PlaybackSource, null>,
+    itemId: string | null,
+  ): Promise<PlaybackState> {
     this.playbackToken += 1;
     const token = this.playbackToken;
 
     // 先使旧 token 失效再停止，避免旧话语的 interrupted 事件覆盖 loading。
     chrome.tts.stop();
-    this.setState("loading");
+    this.state = {
+      status: "loading",
+      source,
+      itemId,
+      updatedAt: Date.now(),
+    };
+    this.onStateChange(this.getState());
 
     try {
       const settings = await loadSettings();
@@ -105,6 +145,18 @@ export class TtsPlayer {
       rate: settings.rate,
       volume: settings.volume,
       pitch: 1,
+      // 明确请求文本边界事件；具体能否返回以及粒度仍由当前语音引擎决定。
+      desiredEventTypes: [
+        "start",
+        "end",
+        "word",
+        "sentence",
+        "interrupted",
+        "cancelled",
+        "error",
+        "pause",
+        "resume",
+      ],
       onEvent: (event) => {
         if (token !== this.playbackToken) {
           return;
@@ -129,6 +181,38 @@ export class TtsPlayer {
 
   /** 将 Chrome TTS 事件归一化为项目定义的有限状态。 */
   private handleTtsEvent(event: chrome.tts.TtsEvent): void {
+    // charIndex 由语音引擎提供；word 事件通常指向下一个即将朗读的词。
+    if (
+      this.currentSpeech !== null &&
+      typeof event.charIndex === "number" &&
+      Number.isFinite(event.charIndex)
+    ) {
+      this.currentSpeech.charIndex = Math.min(
+        this.currentSpeech.text.length,
+        Math.max(0, Math.trunc(event.charIndex)),
+      );
+
+      if (
+        this.currentSpeech.source === "page" &&
+        this.currentSpeech.itemId !== null &&
+        (event.type === "word" || event.type === "sentence")
+      ) {
+        const reportedLength =
+          event.type === "word" &&
+          typeof event.length === "number" &&
+          event.length > 0
+            ? Math.trunc(event.length)
+            : 1;
+        this.onPositionChange({
+          itemId: this.currentSpeech.itemId,
+          charIndex:
+            this.currentSpeech.textOffset + this.currentSpeech.charIndex,
+          length: reportedLength,
+          granularity: event.type,
+        });
+      }
+    }
+
     switch (event.type) {
       case "start":
       case "resume":
@@ -160,6 +244,8 @@ export class TtsPlayer {
   ): void {
     this.state = {
       status,
+      source: this.state.source,
+      itemId: this.state.itemId,
       updatedAt: Date.now(),
       ...(errorMessage ? { errorMessage } : {}),
     };

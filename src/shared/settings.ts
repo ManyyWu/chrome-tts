@@ -5,12 +5,14 @@ export const SETTINGS_KEY = "extensionSettings";
 
 /** 首次安装或存储数据不可用时采用的安全默认设置。 */
 export const DEFAULT_SETTINGS: ExtensionSettings = {
-  version: 1,
+  version: 3,
   voiceName: null,
   voiceExtensionId: null,
   lang: null,
   rate: 1,
   volume: 1,
+  autoPlaySelection: false,
+  showSelectionJumpPrompt: false,
 };
 
 /** 将数值限制在 chrome.tts 允许且本项目支持的范围内。 */
@@ -43,7 +45,7 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       : DEFAULT_SETTINGS.volume;
 
   return {
-    version: 1,
+    version: 3,
     voiceName: isNullableString(stored.voiceName)
       ? stored.voiceName
       : DEFAULT_SETTINGS.voiceName,
@@ -55,6 +57,14 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       : DEFAULT_SETTINGS.lang,
     rate,
     volume,
+    autoPlaySelection:
+      typeof stored.autoPlaySelection === "boolean"
+        ? stored.autoPlaySelection
+        : DEFAULT_SETTINGS.autoPlaySelection,
+    showSelectionJumpPrompt:
+      typeof stored.showSelectionJumpPrompt === "boolean"
+        ? stored.showSelectionJumpPrompt
+        : DEFAULT_SETTINGS.showSelectionJumpPrompt,
   };
 }
 
@@ -76,7 +86,7 @@ export async function updateSettings(
   changes: Partial<Omit<ExtensionSettings, "version">>,
 ): Promise<ExtensionSettings> {
   const current = await loadSettings();
-  const settings = normalizeSettings({ ...current, ...changes, version: 1 });
+  const settings = normalizeSettings({ ...current, ...changes, version: 3 });
 
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
   return settings;

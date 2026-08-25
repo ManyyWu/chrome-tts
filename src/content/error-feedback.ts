@@ -29,6 +29,11 @@ export class ErrorFeedback {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
 
+      /* all: initial 会覆盖浏览器对 hidden 属性的默认 display: none，必须显式恢复。 */
+      :host([hidden]) {
+        display: none;
+      }
+
       .toast {
         box-sizing: border-box;
         max-width: min(560px, calc(100vw - 32px));

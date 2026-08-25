@@ -21,6 +21,11 @@ const rateInput = requireElement<HTMLInputElement>("#rate");
 const rateValue = requireElement<HTMLOutputElement>("#rate-value");
 const volumeInput = requireElement<HTMLInputElement>("#volume");
 const volumeValue = requireElement<HTMLOutputElement>("#volume-value");
+const autoPlaySelectionInput =
+  requireElement<HTMLInputElement>("#auto-play-selection");
+const showSelectionJumpPromptInput = requireElement<HTMLInputElement>(
+  "#show-selection-jump-prompt",
+);
 const errorElement = requireElement<HTMLDivElement>("#popup-error");
 const testActions = requireElement<HTMLDivElement>("#test-actions");
 
@@ -151,6 +156,8 @@ function renderSettings(settings: ExtensionSettings): void {
   rateValue.textContent = `${formatRate(settings.rate)}×`;
   volumeInput.value = String(settings.volume);
   volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
+  autoPlaySelectionInput.checked = settings.autoPlaySelection;
+  showSelectionJumpPromptInput.checked = settings.showSelectionJumpPrompt;
 }
 
 /** popup 自身错误只在实际发生时显示，不保留常驻 statusElement。 */
@@ -183,6 +190,20 @@ volumeInput.addEventListener("input", () => {
 volumeInput.addEventListener("change", () => {
   clearPopupError();
   void updateSettings({ volume: Number(volumeInput.value) }).catch(showPopupError);
+});
+
+autoPlaySelectionInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({
+    autoPlaySelection: autoPlaySelectionInput.checked,
+  }).catch(showPopupError);
+});
+
+showSelectionJumpPromptInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({
+    showSelectionJumpPrompt: showSelectionJumpPromptInput.checked,
+  }).catch(showPopupError);
 });
 
 chrome.tts.onVoicesChanged.addListener(() => {

@@ -14,7 +14,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://end-gfw.com/tweet-page*"
+        "http://*/*",
+        "https://*/*"
       ],
       "js": [
         "dist/content/content-script.js"

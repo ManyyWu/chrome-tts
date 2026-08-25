@@ -50,6 +50,22 @@
       accent-color: #1a73e8;
     }
 
+    .checkbox-field {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .checkbox-field input {
+      flex: 0 0 auto;
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: #1a73e8;
+    }
+
     #popup-error {
       margin: 4px 0 14px;
       padding: 9px 10px;
@@ -111,6 +127,16 @@
       <output id="volume-value" for="volume">100%</output>
     </div>
     <input id="volume" type="range" min="0" max="1" step="0.05" value="1">
+  </div>
+
+  <div class="field checkbox-field">
+    <input id="auto-play-selection" type="checkbox">
+    <label for="auto-play-selection">选择网页文本后自动播放</label>
+  </div>
+
+  <div class="field checkbox-field">
+    <input id="show-selection-jump-prompt" type="checkbox">
+    <label for="show-selection-jump-prompt">选择文本时弹出跳转提示</label>
   </div>
 
   <div id="test-actions"></div>

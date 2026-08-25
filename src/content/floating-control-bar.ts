@@ -1,7 +1,9 @@
 import type { ExtensionSettings, PlaybackState } from "../shared/models";
 
 type ControlIcon =
+  | "previous"
   | "play"
+  | "next"
   | "pause"
   | "loading"
   | "selection"
@@ -14,6 +16,8 @@ type ControlIcon =
 /** 控制栏把界面操作转换成回调，不直接依赖扩展消息或 chrome.tts。 */
 export interface FloatingControlBarActions {
   onTogglePlayback(): void;
+  onPrevious(): void;
+  onNext(): void;
   onPlaySelection(): void;
   onPlayText(text: string): void;
   onRateChange(rate: number): void;
@@ -31,6 +35,8 @@ export class FloatingControlBar {
   private readonly host: HTMLDivElement;
   private readonly controlBarElement: HTMLDivElement;
   private readonly playButton: HTMLButtonElement;
+  private readonly previousButton: HTMLButtonElement;
+  private readonly nextButton: HTMLButtonElement;
   private readonly inputPanel: HTMLDivElement;
   private readonly textInput: HTMLTextAreaElement;
   private readonly inputMessage: HTMLDivElement;
@@ -40,6 +46,8 @@ export class FloatingControlBar {
   private readonly volumeInput: HTMLInputElement;
   private readonly volumeValue: HTMLOutputElement;
   private currentRate = 1;
+  private hasPageItems = false;
+  private isLoading = false;
 
   public constructor(actions: FloatingControlBarActions) {
     this.host = document.createElement("div");
@@ -53,7 +61,9 @@ export class FloatingControlBar {
     this.controlBarElement.setAttribute("role", "toolbar");
     this.controlBarElement.setAttribute("aria-label", "Chrome TTS 快捷控制栏");
 
-    this.playButton = this.createButton("play", "播放固定文本");
+    this.previousButton = this.createButton("previous", "播放上一条");
+    this.playButton = this.createButton("play", "播放页面文本");
+    this.nextButton = this.createButton("next", "播放下一条");
     const selectionButton = this.createButton("selection", "播放选中文本");
     const textButton = this.createButton("text", "输入文本并播放");
     const rateButton = this.createButton("speed", "调整播放速度");
@@ -63,6 +73,8 @@ export class FloatingControlBar {
     dragButton.classList.add("drag-button");
 
     this.playButton.addEventListener("click", actions.onTogglePlayback);
+    this.previousButton.addEventListener("click", actions.onPrevious);
+    this.nextButton.addEventListener("click", actions.onNext);
     selectionButton.addEventListener("click", actions.onPlaySelection);
     textButton.addEventListener("click", () => this.toggleInputPanel());
     rateButton.addEventListener("click", () => this.toggleRatePanel());
@@ -71,7 +83,9 @@ export class FloatingControlBar {
     this.initializeDragging(dragButton);
 
     this.controlBarElement.append(
+      this.previousButton,
       this.playButton,
+      this.nextButton,
       selectionButton,
       textButton,
       rateButton,
@@ -201,17 +215,29 @@ export class FloatingControlBar {
     window.addEventListener("resize", handleViewportResize);
     window.visualViewport?.addEventListener("resize", handleViewportResize);
 
-    // Escape 只关闭扩展自己的输入层，不阻断目标网站继续处理该按键。
-    this.textInput.addEventListener("keydown", (event) => {
+    // 捕获阶段监听可避免网站阻止冒泡后扩展无法感知外部点击。
+    document.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (!event.composedPath().includes(this.host)) {
+          this.closeAllPanels();
+        }
+      },
+      true,
+    );
+
+    // Escape 统一关闭所有弹层，但不阻止网页继续处理同一个键盘事件。
+    document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
-        this.inputPanel.hidden = true;
+        this.closeAllPanels();
       }
-    });
+    }, true);
   }
 
   /** 根据播放器状态更新主按钮的图标、说明和可用性。 */
   public renderState(state: PlaybackState): void {
-    this.playButton.disabled = state.status === "loading";
+    this.isLoading = state.status === "loading";
+    this.playButton.disabled = this.isLoading || !this.hasPageItems;
 
     if (state.status === "loading") {
       this.setPlayButton("loading", "正在准备播放");
@@ -220,8 +246,16 @@ export class FloatingControlBar {
     } else if (state.status === "paused") {
       this.setPlayButton("play", "恢复播放");
     } else {
-      this.setPlayButton("play", "播放固定文本");
+      this.setPlayButton("play", "播放页面文本");
     }
+  }
+
+  /** 根据页面队列位置控制上一条/下一条按钮的边界可用性。 */
+  public renderNavigation(currentIndex: number, total: number): void {
+    this.hasPageItems = total > 0;
+    this.previousButton.disabled = total === 0 || currentIndex <= 0;
+    this.nextButton.disabled = total === 0 || currentIndex >= total - 1;
+    this.playButton.disabled = !this.hasPageItems || this.isLoading;
   }
 
   /** 将 storage 中的倍速和音量同步到控制栏，不触发保存回调。 */
@@ -372,6 +406,13 @@ export class FloatingControlBar {
     this.volumePanel.hidden = !this.volumePanel.hidden;
   }
 
+  /** 关闭文本输入、倍速和音量三个互斥弹层。 */
+  private closeAllPanels(): void {
+    this.inputPanel.hidden = true;
+    this.ratePanel.hidden = true;
+    this.volumePanel.hidden = true;
+  }
+
   /** 将微调结果限制在 0.5–1.5，并消除小数累加产生的浮点误差。 */
   private changeRate(
     requestedRate: number,
@@ -442,12 +483,20 @@ export class FloatingControlBar {
     };
 
     switch (icon) {
+      case "previous":
+        appendShape("path", { d: "M18 5 8 12l10 7z", fill: "currentColor", stroke: "none" });
+        appendShape("path", { d: "M6 5v14" });
+        break;
       case "play":
         appendShape("path", { d: "M8 5v14l11-7z", fill: "currentColor", stroke: "none" });
         break;
       case "pause":
         appendShape("rect", { x: "6", y: "5", width: "4", height: "14", rx: "1", fill: "currentColor", stroke: "none" });
         appendShape("rect", { x: "14", y: "5", width: "4", height: "14", rx: "1", fill: "currentColor", stroke: "none" });
+        break;
+      case "next":
+        appendShape("path", { d: "m6 5 10 7-10 7z", fill: "currentColor", stroke: "none" });
+        appendShape("path", { d: "M18 5v14" });
         break;
       case "loading":
         svg.classList.add("loading-icon");
