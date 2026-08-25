@@ -2,8 +2,25 @@
   "manifest_version": 3,
   "name": "Chrome TTS",
   "version": "1.0.0",
+  "minimum_chrome_version": "127",
   "permissions": [
+    "clipboardRead",
+    "storage",
     "tts"
+  ],
+  "background": {
+    "service_worker": "dist/background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://end-gfw.com/tweet-page*"
+      ],
+      "js": [
+        "dist/content/content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
   ],
   "action": {
     "default_popup": "popup.html"

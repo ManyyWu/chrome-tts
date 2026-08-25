@@ -6,57 +6,114 @@
 
   <style>
     body {
-      width: 420px;
+      box-sizing: border-box;
+      width: 360px;
+      margin: 0;
       padding: 16px;
-      font-family: sans-serif;
+      color: #202124;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 18px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 7px;
+      font-size: 13px;
+      font-weight: 600;
     }
 
     select,
-    textarea,
+    input,
     button {
       box-sizing: border-box;
       width: 100%;
-      margin-bottom: 12px;
     }
 
-    textarea {
-      height: 140px;
-      resize: vertical;
+    select {
+      min-height: 36px;
+      padding: 6px;
+      border: 1px solid #c7cacf;
+      border-radius: 7px;
     }
 
-    button {
-      padding: 8px;
+    input[type="range"] {
+      accent-color: #1a73e8;
     }
 
-    #status {
-      white-space: pre-wrap;
-      font-family: monospace;
+    #popup-error {
+      margin: 4px 0 14px;
+      padding: 9px 10px;
+      border-radius: 7px;
+      color: #7d1b16;
+      background: #fce8e6;
       font-size: 12px;
+      line-height: 1.45;
+    }
+
+    #popup-error[hidden] {
+      display: none;
+    }
+
+    #test-actions:not(:empty) {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #e0e3e7;
+    }
+
+    .test-button {
+      padding: 9px;
+      border: 1px solid #c7cacf;
+      border-radius: 7px;
+      color: #7d1b16;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    .test-button:hover {
+      background: #fce8e6;
     }
   </style>
 </head>
 
 <body>
-  <label for="voice">声音</label>
-  <select id="voice"></select>
+  <h1>Chrome TTS 设置</h1>
 
-  <label for="text">文本</label>
-  <textarea id="text">你好，这是一段 Chrome TTS 测试。今天天气很好，我们正在检查 macOS 系统语音能否正常工作。</textarea>
+  <div id="popup-error" role="alert" hidden></div>
 
-  <label for="rate">语速</label>
-  <input
-    id="rate"
-    type="range"
-    min="0.5"
-    max="2"
-    step="0.1"
-    value="1"
-  >
+  <div class="field">
+    <div class="field-header">
+      <label for="voice">声音</label>
+    </div>
+    <select id="voice"></select>
+  </div>
 
-  <button id="speak">播放</button>
-  <button id="stop">停止</button>
+  <div class="field">
+    <div class="field-header">
+      <label for="rate">语速</label>
+      <output id="rate-value" for="rate">1×</output>
+    </div>
+    <input id="rate" type="range" min="0.5" max="1.5" step="0.1" value="1">
+  </div>
 
-  <div id="status">正在读取声音列表……</div>
+  <div class="field">
+    <div class="field-header">
+      <label for="volume">音量</label>
+      <output id="volume-value" for="volume">100%</output>
+    </div>
+    <input id="volume" type="range" min="0" max="1" step="0.05" value="1">
+  </div>
+
+  <div id="test-actions"></div>
 
   <script src="dist/popup.js"></script>
 </body>

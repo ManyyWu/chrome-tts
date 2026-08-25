@@ -1,5 +1,56 @@
 "use strict";
 (() => {
+  // src/shared/feature-flags.ts
+  var ENABLE_ERROR_TEST_BUTTON = true;
+
+  // src/shared/settings.ts
+  var SETTINGS_KEY = "extensionSettings";
+  var DEFAULT_SETTINGS = {
+    version: 1,
+    voiceName: null,
+    voiceExtensionId: null,
+    lang: null,
+    rate: 1,
+    volume: 1
+  };
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+  function isNullableString(value) {
+    return value === null || typeof value === "string";
+  }
+  function normalizeSettings(value) {
+    if (typeof value !== "object" || value === null) {
+      return { ...DEFAULT_SETTINGS };
+    }
+    const stored = value;
+    const rate = typeof stored.rate === "number" && Number.isFinite(stored.rate) ? clamp(Math.round(stored.rate * 10) / 10, 0.5, 1.5) : DEFAULT_SETTINGS.rate;
+    const volume = typeof stored.volume === "number" && Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : DEFAULT_SETTINGS.volume;
+    return {
+      version: 1,
+      voiceName: isNullableString(stored.voiceName) ? stored.voiceName : DEFAULT_SETTINGS.voiceName,
+      voiceExtensionId: isNullableString(stored.voiceExtensionId) ? stored.voiceExtensionId : DEFAULT_SETTINGS.voiceExtensionId,
+      lang: isNullableString(stored.lang) ? stored.lang : DEFAULT_SETTINGS.lang,
+      rate,
+      volume
+    };
+  }
+  async function loadSettings() {
+    const result = await chrome.storage.local.get(SETTINGS_KEY);
+    const storedValue = result[SETTINGS_KEY];
+    const settings = normalizeSettings(storedValue);
+    if (JSON.stringify(storedValue) !== JSON.stringify(settings)) {
+      await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+    }
+    return settings;
+  }
+  async function updateSettings(changes) {
+    const current = await loadSettings();
+    const settings = normalizeSettings({ ...current, ...changes, version: 1 });
+    await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+    return settings;
+  }
+
   // src/popup.ts
   function requireElement(selector) {
     const element = document.querySelector(selector);
@@ -9,143 +60,149 @@
     return element;
   }
   var voiceSelect = requireElement("#voice");
-  var textInput = requireElement("#text");
   var rateInput = requireElement("#rate");
-  var statusElement = requireElement("#status");
-  var speakButton = requireElement("#speak");
-  var stopButton = requireElement("#stop");
+  var rateValue = requireElement("#rate-value");
+  var volumeInput = requireElement("#volume");
+  var volumeValue = requireElement("#volume-value");
+  var errorElement = requireElement("#popup-error");
+  var testActions = requireElement("#test-actions");
   var voices = [];
   var languagePriority = ["zh-CN", "zh-TW", "en-US", "ja-JP"];
-  function getErrorMessage(error) {
-    return error instanceof Error ? error.message : String(error);
-  }
   function compareVoices(firstVoice, secondVoice) {
     const firstLanguage = firstVoice.lang ?? "";
     const secondLanguage = secondVoice.lang ?? "";
-    const firstPriority = languagePriority.indexOf(
+    const firstIndex = languagePriority.indexOf(
       firstLanguage
     );
-    const secondPriority = languagePriority.indexOf(
+    const secondIndex = languagePriority.indexOf(
       secondLanguage
     );
-    const normalizedFirstPriority = firstPriority >= 0 ? firstPriority : languagePriority.length;
-    const normalizedSecondPriority = secondPriority >= 0 ? secondPriority : languagePriority.length;
-    const priorityDifference = normalizedFirstPriority - normalizedSecondPriority;
-    if (priorityDifference !== 0) {
-      return priorityDifference;
-    }
-    const languageDifference = firstLanguage.localeCompare(secondLanguage);
-    if (languageDifference !== 0) {
-      return languageDifference;
-    }
-    return (firstVoice.voiceName ?? "").localeCompare(
-      secondVoice.voiceName ?? ""
-    );
+    const priorityDifference = (firstIndex < 0 ? languagePriority.length : firstIndex) - (secondIndex < 0 ? languagePriority.length : secondIndex);
+    return priorityDifference || firstLanguage.localeCompare(secondLanguage) || (firstVoice.voiceName ?? "").localeCompare(secondVoice.voiceName ?? "");
   }
   function findPreferredVoiceIndex(availableVoices) {
-    const mandarinVoiceIndex = availableVoices.findIndex(
-      (voice) => voice.voiceName?.includes("Google") === true
-    );
-    if (mandarinVoiceIndex >= 0) {
-      return mandarinVoiceIndex;
-    }
-    const simplifiedChineseIndex = availableVoices.findIndex(
-      (voice) => voice.lang === "zh-CN"
-    );
-    if (simplifiedChineseIndex >= 0) {
-      return simplifiedChineseIndex;
-    }
-    const traditionalChineseIndex = availableVoices.findIndex(
-      (voice) => voice.lang === "zh-TW"
-    );
-    if (traditionalChineseIndex >= 0) {
-      return traditionalChineseIndex;
+    const priorities = [
+      (voice) => voice.remote !== true && voice.lang === "zh-CN",
+      (voice) => voice.remote !== true && voice.lang === "zh-TW",
+      (voice) => voice.remote !== true && voice.lang?.startsWith("zh") === true
+    ];
+    for (const matches of priorities) {
+      const index = availableVoices.findIndex(matches);
+      if (index >= 0) {
+        return index;
+      }
     }
     return availableVoices.length > 0 ? 0 : -1;
   }
+  function findStoredVoiceIndex(availableVoices, settings) {
+    const exactIndex = availableVoices.findIndex(
+      (voice) => voice.voiceName === settings.voiceName && (voice.extensionId ?? null) === settings.voiceExtensionId
+    );
+    if (exactIndex >= 0) {
+      return exactIndex;
+    }
+    const sameNameIndex = availableVoices.findIndex(
+      (voice) => voice.voiceName === settings.voiceName
+    );
+    return sameNameIndex >= 0 ? sameNameIndex : findPreferredVoiceIndex(availableVoices);
+  }
   async function loadVoices() {
-    voices = await chrome.tts.getVoices();
+    voices = [...await chrome.tts.getVoices()].sort(compareVoices);
     voiceSelect.replaceChildren();
     if (voices.length === 0) {
-      statusElement.textContent = "Chrome \u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u58F0\u97F3\u3002";
-      return;
+      throw new Error("Chrome \u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u58F0\u97F3\u3002");
     }
-    const sortedVoices = [...voices].sort(compareVoices);
     const languageGroups = /* @__PURE__ */ new Map();
-    for (const voice of sortedVoices) {
+    for (const [index, voice] of voices.entries()) {
       const language = voice.lang ?? "\u672A\u77E5\u8BED\u8A00";
-      let languageGroup = languageGroups.get(language);
-      if (!languageGroup) {
-        languageGroup = document.createElement("optgroup");
-        languageGroup.label = language;
-        languageGroups.set(language, languageGroup);
-        voiceSelect.append(languageGroup);
+      let group = languageGroups.get(language);
+      if (!group) {
+        group = document.createElement("optgroup");
+        group.label = language;
+        languageGroups.set(language, group);
+        voiceSelect.append(group);
       }
       const option = document.createElement("option");
-      option.value = voice.voiceName ?? "";
-      option.textContent = `${voice.remote ? "\u8FDC\u7A0B | " : "\u672C\u5730 | "}${voice.voiceName ?? "\u672A\u547D\u540D\u58F0\u97F3"}`;
-      if (voice.lang === "zh-CN") {
-        option.textContent = `\u2605 ${option.textContent}`;
-      }
-      languageGroup.append(option);
+      option.value = String(index);
+      option.textContent = `${voice.lang === "zh-CN" ? "\u2605 " : ""}${voice.remote ? "\u8FDC\u7A0B | " : "\u672C\u5730 | "}${voice.voiceName ?? "\u672A\u547D\u540D\u58F0\u97F3"}`;
+      group.append(option);
     }
-    const preferredIndex = findPreferredVoiceIndex(sortedVoices);
-    if (preferredIndex >= 0) {
-      voiceSelect.selectedIndex = preferredIndex;
+    const settings = await loadSettings();
+    const selectedIndex = findStoredVoiceIndex(voices, settings);
+    if (selectedIndex >= 0) {
+      voiceSelect.value = String(selectedIndex);
+      await saveSelectedVoice(selectedIndex);
     }
-    const chineseVoiceCount = voices.filter(
-      (voice) => voice.lang?.startsWith("zh-CN")
-    ).length;
-    statusElement.textContent = `\u68C0\u6D4B\u5230 ${voices.length} \u4E2A\u58F0\u97F3\uFF0C\u5176\u4E2D\u4E2D\u6587\u58F0\u97F3\uFF1A${chineseVoiceCount}`;
   }
-  speakButton.addEventListener("click", async () => {
-    const text = textInput.value.trim();
-    const voiceName = voiceSelect.value;
-    const selectedVoice = voices.find((voice) => voice.voiceName === voiceName);
-    if (!text) {
-      statusElement.textContent = "\u8BF7\u8F93\u5165\u6D4B\u8BD5\u6587\u672C\u3002";
-      return;
+  async function saveSelectedVoice(index) {
+    const voice = voices[index];
+    if (!voice) {
+      throw new Error("\u9009\u4E2D\u7684\u58F0\u97F3\u5DF2\u7ECF\u4E0D\u53EF\u7528\u3002");
     }
-    chrome.tts.stop();
-    statusElement.textContent = `\u51C6\u5907\u64AD\u653E
-\u58F0\u97F3\uFF1A${voiceName || "\u7CFB\u7EDF\u9ED8\u8BA4"}
-\u8BED\u8A00\uFF1A${selectedVoice?.lang ?? "zh-CN"}
-\u957F\u5EA6\uFF1A${text.length}`;
-    const options = {
-      // 声音缺少语言信息时使用简体中文，保证传给 Chrome 的 lang 始终有值。
-      lang: selectedVoice?.lang ?? "zh-CN",
-      // input.value 始终是字符串，需要转换为 chrome.tts 所需的 number。
-      rate: Number(rateInput.value),
-      pitch: 1,
-      volume: 1,
-      // 不进入现有播放队列；结合上方 stop()，本次请求会立即独立播放。
-      enqueue: false,
-      // Chrome 会通过该回调报告开始、单词边界、结束、取消和错误等播放事件。
-      onEvent(event) {
-        statusElement.textContent = `\u4E8B\u4EF6\uFF1A${event.type}
-\u58F0\u97F3\uFF1A${voiceName || "\u7CFB\u7EDF\u9ED8\u8BA4"}
-\u4F4D\u7F6E\uFF1A${event.charIndex ?? "\u672A\u77E5"}
-\u957F\u5EA6\uFF1A${event.length ?? "\u672A\u77E5"}
-\u9519\u8BEF\uFF1A${event.errorMessage ?? "\u65E0"}`;
-      }
-    };
-    if (voiceName) {
-      options.voiceName = voiceName;
-    }
-    try {
-      await chrome.tts.speak(text, options);
-    } catch (error) {
-      statusElement.textContent = `\u8C03\u7528\u5931\u8D25\uFF1A${getErrorMessage(error)}`;
-    }
+    await updateSettings({
+      voiceName: voice.voiceName ?? null,
+      voiceExtensionId: voice.extensionId ?? null,
+      lang: voice.lang ?? null
+    });
+  }
+  function renderSettings(settings) {
+    rateInput.value = String(settings.rate);
+    rateValue.textContent = `${formatRate(settings.rate)}\xD7`;
+    volumeInput.value = String(settings.volume);
+    volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
+  }
+  function showPopupError(error) {
+    errorElement.textContent = error instanceof Error ? error.message : String(error);
+    errorElement.hidden = false;
+  }
+  function clearPopupError() {
+    errorElement.hidden = true;
+    errorElement.textContent = "";
+  }
+  voiceSelect.addEventListener("change", () => {
+    clearPopupError();
+    void saveSelectedVoice(Number(voiceSelect.value)).catch(showPopupError);
   });
-  stopButton.addEventListener("click", () => {
-    chrome.tts.stop();
-    statusElement.textContent = "\u5DF2\u505C\u6B62\u3002";
+  rateInput.addEventListener("input", () => {
+    rateValue.textContent = `${formatRate(Number(rateInput.value))}\xD7`;
+  });
+  rateInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({ rate: Number(rateInput.value) }).catch(showPopupError);
+  });
+  volumeInput.addEventListener("input", () => {
+    volumeValue.textContent = `${Math.round(Number(volumeInput.value) * 100)}%`;
+  });
+  volumeInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({ volume: Number(volumeInput.value) }).catch(showPopupError);
   });
   chrome.tts.onVoicesChanged.addListener(() => {
-    void loadVoices();
+    void loadVoices().catch(showPopupError);
   });
-  loadVoices().catch((error) => {
-    statusElement.textContent = `\u8BFB\u53D6\u58F0\u97F3\u5931\u8D25\uFF1A${getErrorMessage(error)}`;
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "local" && SETTINGS_KEY in changes) {
+      void loadSettings().then(renderSettings).catch(showPopupError);
+    }
   });
+  if (ENABLE_ERROR_TEST_BUTTON) {
+    const testButton = document.createElement("button");
+    testButton.type = "button";
+    testButton.className = "test-button";
+    testButton.textContent = "\u89E6\u53D1\u6D4B\u8BD5\u9519\u8BEF";
+    testButton.addEventListener("click", () => {
+      clearPopupError();
+      const request = { type: "test:trigger-error" };
+      void chrome.runtime.sendMessage(request).then((response) => {
+        if (!response.ok) {
+          throw new Error(response.error);
+        }
+      }).catch(showPopupError);
+    });
+    testActions.append(testButton);
+  }
+  void Promise.all([loadSettings(), loadVoices()]).then(([settings]) => renderSettings(settings)).catch(showPopupError);
+  function formatRate(rate) {
+    return Number(rate.toFixed(2)).toString();
+  }
 })();

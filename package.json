@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/popup.ts --bundle --format=iife --target=chrome120 --outfile=dist/popup.js",
+    "build": "esbuild src/popup.ts src/background/service-worker.ts src/content/content-script.ts --bundle --format=iife --target=chrome127 --outbase=src --outdir=dist",
     "check": "tsc --noEmit",
-    "watch": "esbuild src/popup.ts --bundle --format=iife --target=chrome120 --outfile=dist/popup.js --watch"
+    "watch": "esbuild src/popup.ts src/background/service-worker.ts src/content/content-script.ts --bundle --format=iife --target=chrome127 --outbase=src --outdir=dist --watch"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.36",
