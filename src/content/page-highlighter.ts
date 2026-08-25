@@ -24,27 +24,19 @@ export class PageHighlighter {
   private mappedElement: HTMLElement | null = null;
   private characterMap: CharacterRange[] = [];
   private readonly positionOverlay: HTMLDivElement;
+  private readonly styleElement: HTMLStyleElement;
 
   public constructor(private readonly adapter: PageAdapter) {
-    if (!document.getElementById(STYLE_ID)) {
-      const style = document.createElement("style");
-      style.id = STYLE_ID;
-      style.textContent = `
-        .${CURRENT_CLASS} {
-          outline: 3px solid #22a06b !important;
-          outline-offset: 4px !important;
-          background: rgb(34 160 107 / 9%) !important;
-          transition: background-color 120ms ease, outline-color 120ms ease !important;
-        }
-        ::highlight(${POSITION_HIGHLIGHT_NAME}) {
-          color: #063c2b;
-          background-color: #6ee7b7;
-          text-decoration: underline 2px #16845b;
-          text-underline-offset: 2px;
-        }
-      `;
-      document.documentElement.append(style);
+    const existingStyle = document.getElementById(STYLE_ID);
+    this.styleElement =
+      existingStyle instanceof HTMLStyleElement
+        ? existingStyle
+        : document.createElement("style");
+    if (!this.styleElement.isConnected) {
+      this.styleElement.id = STYLE_ID;
+      document.documentElement.append(this.styleElement);
     }
+    this.renderColors("#22a06b", "#e6f6ef");
 
     this.positionOverlay = document.createElement("div");
     this.positionOverlay.id = POSITION_OVERLAY_ID;
@@ -58,6 +50,24 @@ export class PageHighlighter {
     document.documentElement.append(this.positionOverlay);
     window.addEventListener("scroll", () => this.clearPosition(), true);
     window.addEventListener("resize", () => this.clearPosition());
+  }
+
+  /** 更新整段高亮配色；颜色已在 storage 归一化，仅写入本扩展专属样式节点。 */
+  public renderColors(borderColor: string, backgroundColor: string): void {
+    this.styleElement.textContent = `
+        .${CURRENT_CLASS} {
+          outline: 3px solid ${borderColor} !important;
+          outline-offset: 4px !important;
+          background: ${backgroundColor} !important;
+          transition: background-color 120ms ease, outline-color 120ms ease !important;
+        }
+        ::highlight(${POSITION_HIGHLIGHT_NAME}) {
+          color: #063c2b;
+          background-color: #6ee7b7;
+          text-decoration: underline 2px #16845b;
+          text-underline-offset: 2px;
+        }
+      `;
   }
 
   /** 切换整段高亮；只有条目真正变化时才滚动，暂停/恢复不会反复移动页面。 */

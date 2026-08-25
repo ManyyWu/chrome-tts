@@ -22,6 +22,12 @@ const rateInput = requireElement<HTMLInputElement>("#rate");
 const rateValue = requireElement<HTMLOutputElement>("#rate-value");
 const volumeInput = requireElement<HTMLInputElement>("#volume");
 const volumeValue = requireElement<HTMLOutputElement>("#volume-value");
+const highlightBorderColorInput = requireElement<HTMLInputElement>(
+  "#highlight-border-color",
+);
+const highlightBackgroundColorInput = requireElement<HTMLInputElement>(
+  "#highlight-background-color",
+);
 const autoPlaySelectionInput =
   requireElement<HTMLInputElement>("#auto-play-selection");
 const showSelectionJumpPromptInput = requireElement<HTMLInputElement>(
@@ -104,13 +110,29 @@ function findStoredVoiceIndex(
     : findPreferredVoiceIndex(availableVoices);
 }
 
-/** 读取声音并恢复选择；已删除的声音会降级到当前可用默认项。 */
+/**
+ * 读取声音并恢复选择；已删除的声音会降级到当前可用默认项。
+ * Edge Android 可以调用系统 TTS 播放，但可能无法枚举系统声音。此时只禁用声音选择，
+ * 不改写已保存的声音设置，防止同一份代码影响能够正常枚举声音的桌面浏览器。
+ */
 async function loadVoices(): Promise<void> {
   voices = [...(await chrome.tts.getVoices())].sort(compareVoices);
   voiceSelect.replaceChildren();
   if (voices.length === 0) {
-    throw new Error("Chrome 没有返回可用声音。");
+    const defaultVoiceOption = document.createElement("option");
+    defaultVoiceOption.value = "";
+    defaultVoiceOption.textContent = "默认使用本地 TTS";
+    defaultVoiceOption.selected = true;
+    voiceSelect.append(defaultVoiceOption);
+    voiceSelect.disabled = true;
+    voiceSelect.title =
+      "当前浏览器不提供声音列表，播放时将调用系统默认的本地 TTS。";
+    return;
   }
+
+  // 声音列表恢复可用时解除移动端降级状态，继续执行原有桌面端选择逻辑。
+  voiceSelect.disabled = false;
+  voiceSelect.title = "";
 
   const languageGroups = new Map<string, HTMLOptGroupElement>();
   for (const [index, voice] of voices.entries()) {
@@ -161,6 +183,8 @@ function renderSettings(settings: ExtensionSettings): void {
   rateValue.textContent = `${formatRate(settings.rate)}×`;
   volumeInput.value = String(settings.volume);
   volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
+  highlightBorderColorInput.value = settings.highlightBorderColor;
+  highlightBackgroundColorInput.value = settings.highlightBackgroundColor;
   autoPlaySelectionInput.checked = settings.autoPlaySelection;
   showSelectionJumpPromptInput.checked = settings.showSelectionJumpPrompt;
   playAllVisibleTextInput.checked = settings.playAllVisibleText;
@@ -203,6 +227,20 @@ volumeInput.addEventListener("input", () => {
 volumeInput.addEventListener("change", () => {
   clearPopupError();
   void updateSettings({ volume: Number(volumeInput.value) }).catch(showPopupError);
+});
+
+highlightBorderColorInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({
+    highlightBorderColor: highlightBorderColorInput.value,
+  }).catch(showPopupError);
+});
+
+highlightBackgroundColorInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({
+    highlightBackgroundColor: highlightBackgroundColorInput.value,
+  }).catch(showPopupError);
 });
 
 autoPlaySelectionInput.addEventListener("change", () => {

@@ -49,12 +49,14 @@ export interface ExtensionError {
 
 /** 持久化设置的当前结构，version 用于后续迁移旧数据。 */
 export interface ExtensionSettings {
-  version: 5;
+  version: 6;
   voiceName: string | null;
   voiceExtensionId: string | null;
   lang: string | null;
   rate: number;
   volume: number;
+  highlightBorderColor: string;
+  highlightBackgroundColor: string;
   autoPlaySelection: boolean;
   showSelectionJumpPrompt: boolean;
   playAllVisibleText: boolean;

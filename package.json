@@ -1,6 +1,6 @@
 {
   "name": "chrome-tts",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
     "build": "esbuild src/settings.ts src/background/service-worker.ts src/content/content-script.ts --bundle --format=iife --target=chrome127 --outbase=src --outdir=dist",

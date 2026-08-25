@@ -5,12 +5,14 @@ export const SETTINGS_KEY = "extensionSettings";
 
 /** 首次安装或存储数据不可用时采用的安全默认设置。 */
 export const DEFAULT_SETTINGS: ExtensionSettings = {
-  version: 5,
+  version: 6,
   voiceName: null,
   voiceExtensionId: null,
   lang: null,
   rate: 1,
   volume: 1,
+  highlightBorderColor: "#22a06b",
+  highlightBackgroundColor: "#e6f6ef",
   autoPlaySelection: false,
   showSelectionJumpPrompt: false,
   playAllVisibleText: false,
@@ -25,6 +27,13 @@ function clamp(value: number, minimum: number, maximum: number): number {
 /** 判断未知值是否为字符串或 null，用于校验 storage 中的可选标识。 */
 function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
+}
+
+/** 颜色设置只接受标准六位十六进制值，防止任意字符串进入动态 CSS。 */
+function normalizeColor(value: unknown, fallback: string): string {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/iu.test(value)
+    ? value.toLowerCase()
+    : fallback;
 }
 
 /**
@@ -47,7 +56,7 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       : DEFAULT_SETTINGS.volume;
 
   return {
-    version: 5,
+    version: 6,
     voiceName: isNullableString(stored.voiceName)
       ? stored.voiceName
       : DEFAULT_SETTINGS.voiceName,
@@ -59,6 +68,14 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       : DEFAULT_SETTINGS.lang,
     rate,
     volume,
+    highlightBorderColor: normalizeColor(
+      stored.highlightBorderColor,
+      DEFAULT_SETTINGS.highlightBorderColor,
+    ),
+    highlightBackgroundColor: normalizeColor(
+      stored.highlightBackgroundColor,
+      DEFAULT_SETTINGS.highlightBackgroundColor,
+    ),
     autoPlaySelection:
       typeof stored.autoPlaySelection === "boolean"
         ? stored.autoPlaySelection
@@ -96,7 +113,7 @@ export async function updateSettings(
   changes: Partial<Omit<ExtensionSettings, "version">>,
 ): Promise<ExtensionSettings> {
   const current = await loadSettings();
-  const settings = normalizeSettings({ ...current, ...changes, version: 5 });
+  const settings = normalizeSettings({ ...current, ...changes, version: 6 });
 
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
   return settings;

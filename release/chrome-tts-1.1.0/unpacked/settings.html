@@ -58,15 +58,6 @@
       accent-color: #1a73e8;
     }
 
-    input[type="color"] {
-      height: 36px;
-      padding: 3px;
-      border: 1px solid #c7cacf;
-      border-radius: 7px;
-      background: #fff;
-      cursor: pointer;
-    }
-
     .checkbox-field {
       display: flex;
       align-items: center;
@@ -125,7 +116,7 @@
 
   <div class="field checkbox-field">
     <input id="global-enabled" type="checkbox">
-    <label for="global-enabled">激活插件</label>
+    <label for="global-enabled">全局激活</label>
   </div>
 
   <div class="field">
@@ -149,20 +140,6 @@
       <output id="volume-value" for="volume">100%</output>
     </div>
     <input id="volume" type="range" min="0" max="1" step="0.05" value="1">
-  </div>
-
-  <div class="field">
-    <div class="field-header">
-      <label for="highlight-border-color">高亮边框颜色</label>
-    </div>
-    <input id="highlight-border-color" type="color" value="#22a06b">
-  </div>
-
-  <div class="field">
-    <div class="field-header">
-      <label for="highlight-background-color">高亮背景颜色</label>
-    </div>
-    <input id="highlight-background-color" type="color" value="#e6f6ef">
   </div>
 
   <div class="field checkbox-field">

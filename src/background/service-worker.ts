@@ -71,6 +71,7 @@ function publishPosition(position: PlaybackPosition): void {
 }
 
 const player = new TtsPlayer(publishState, publishPosition);
+const platformInfoPromise = chrome.runtime.getPlatformInfo();
 
 chrome.runtime.onInstalled.addListener(() => {
   void loadSettings().catch((error: unknown) => {
@@ -279,23 +280,42 @@ async function togglePagePlayback(tabId: number): Promise<PlaybackState> {
       return state;
     }
     if (state.status === "playing") {
-      const pausedState = player.pause();
+      const pausedState = player.pause(await isAndroidPlatform());
       await savePausedPlayback(tabId);
       return pausedState;
     }
     if (state.status === "paused") {
-      await clearPausedPlayback();
-      return player.resume();
+      if (!(await isAndroidPlatform())) {
+        await clearPausedPlayback();
+        return player.resume();
+      }
+
+      const pausedPlayback = await loadPausedPlayback();
+      if (pausedPlayback?.tabId === tabId) {
+        return replayPausedPlayback(pausedPlayback);
+      }
+
+      // session 数据意外不可用时回退到当前页面条目，保证按钮不会进入无声播放状态。
+      const queue = requirePageQueue(tabId);
+      return playPageItem(tabId, queue.currentIndex);
     }
   }
 
   const pausedPlayback = await loadPausedPlayback();
   if (pausedPlayback?.tabId === tabId) {
+    if (await isAndroidPlatform()) {
+      return replayPausedPlayback(pausedPlayback);
+    }
     return resumePausedPlayback(pausedPlayback);
   }
 
   const queue = requirePageQueue(tabId);
   return playPageItem(tabId, queue.currentIndex);
+}
+
+/** Edge Android 的 chrome.tts.resume 不可靠；平台信息缓存后供每次切换复用。 */
+async function isAndroidPlatform(): Promise<boolean> {
+  return (await platformInfoPromise).os === "android";
 }
 
 /** 上一条/下一条始终通过新话语播放，TtsPlayer 会先让旧 token 失效并停止旧话语。 */
@@ -412,6 +432,23 @@ async function resumePausedPlayback(
       pausedPlayback.source,
       pausedPlayback.itemId,
       recoveryOffset,
+    ),
+  );
+}
+
+/**
+ * Android 暂停会终止本地 TTS 话语；恢复时按需求重新播放本次完整话语，不使用
+ * charIndex 截取。textOffset 仍保留，确保从页面跳转位置开始的话语高亮索引不偏移。
+ */
+async function replayPausedPlayback(
+  pausedPlayback: PausedPlayback,
+): Promise<PlaybackState> {
+  return startPlaybackForTab(pausedPlayback.tabId, () =>
+    player.playText(
+      pausedPlayback.text,
+      pausedPlayback.source,
+      pausedPlayback.itemId,
+      pausedPlayback.textOffset,
     ),
   );
 }

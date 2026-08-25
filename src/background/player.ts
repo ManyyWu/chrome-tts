@@ -50,16 +50,24 @@ export class TtsPlayer {
     return this.currentSpeech === null ? null : { ...this.currentSpeech };
   }
 
-  /** 暂停当前话语；loading 状态尚未开始合成，因此保持不变。 */
-  public pause(): PlaybackState {
+  /**
+   * 暂停当前话语。桌面端保留原生暂停；Android 的本地 TTS 无法可靠 resume，需停止
+   * 原话语，再由 service worker 重新播放本次完整文本。
+   */
+  public pause(useRestartFallback: boolean): PlaybackState {
     if (this.state.status === "playing") {
-      chrome.tts.pause();
+      if (useRestartFallback) {
+        this.playbackToken += 1;
+        chrome.tts.stop();
+      } else {
+        chrome.tts.pause();
+      }
       this.setState("paused");
     }
     return this.getState();
   }
 
-  /** 恢复被暂停的话语。 */
+  /** 桌面端恢复由浏览器原生暂停的话语；Android 不调用此方法。 */
   public resume(): PlaybackState {
     if (this.state.status === "paused") {
       chrome.tts.resume();

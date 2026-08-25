@@ -224,6 +224,10 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     nextSettings: ExtensionSettings,
   ): Promise<void> {
     controlBar.renderSettings(nextSettings);
+    highlighter.renderColors(
+      nextSettings.highlightBorderColor,
+      nextSettings.highlightBackgroundColor,
+    );
     await applyGlobalActivation(nextSettings);
     await applyTextScanMode(nextSettings);
   }

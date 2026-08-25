@@ -225,7 +225,10 @@ export class FloatingControlBar {
 
     // 拖动后使用固定 left/top；视口缩小时重新约束，避免控制栏留在不可见区域。
     const handleViewportResize = (): void => {
-      window.requestAnimationFrame(() => this.constrainToViewport());
+      window.requestAnimationFrame(() => {
+        this.constrainToViewport();
+        this.constrainInputPanelToViewport();
+      });
     };
     window.addEventListener("resize", handleViewportResize);
     window.visualViewport?.addEventListener("resize", handleViewportResize);
@@ -439,8 +442,55 @@ export class FloatingControlBar {
     this.inputPanel.hidden = !this.inputPanel.hidden;
     this.showInputMessage("");
     if (!this.inputPanel.hidden) {
+      this.constrainInputPanelToViewport();
       this.textInput.focus();
+      // Android 软键盘会在 focus 后改变 visualViewport，再补一次布局以避免短暂越界。
+      window.requestAnimationFrame(() => this.constrainInputPanelToViewport());
     }
+  }
+
+  /**
+   * 根据移动端实际可视窗口限制文本输入层尺寸和位置。
+   * visualViewport 能反映地址栏、屏幕方向及软键盘占用后的区域；通过 transform 校正
+   * 绝对定位弹层，不改变浮动条自身位置和用户保存的拖动比例。
+   */
+  private constrainInputPanelToViewport(): void {
+    if (this.inputPanel.hidden) {
+      return;
+    }
+
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft ?? 0;
+    const viewportTop = viewport?.offsetTop ?? 0;
+    const viewportWidth = viewport?.width ?? document.documentElement.clientWidth;
+    const viewportHeight = viewport?.height ?? document.documentElement.clientHeight;
+    const safeMargin = 12;
+
+    this.inputPanel.style.width = `${Math.min(336, Math.max(160, viewportWidth - safeMargin * 2))}px`;
+    this.textInput.style.height = `${Math.min(220, Math.max(96, viewportHeight - 120))}px`;
+    this.inputPanel.style.transform = "none";
+
+    const rect = this.inputPanel.getBoundingClientRect();
+    const minimumLeft = viewportLeft + safeMargin;
+    const maximumRight = viewportLeft + viewportWidth - safeMargin;
+    const minimumTop = viewportTop + safeMargin;
+    const maximumBottom = viewportTop + viewportHeight - safeMargin;
+    let translateX = 0;
+    let translateY = 0;
+
+    if (rect.left < minimumLeft) {
+      translateX = minimumLeft - rect.left;
+    } else if (rect.right > maximumRight) {
+      translateX = maximumRight - rect.right;
+    }
+    if (rect.top < minimumTop) {
+      translateY = minimumTop - rect.top;
+    } else if (rect.bottom > maximumBottom) {
+      translateY = maximumBottom - rect.bottom;
+    }
+
+    this.inputPanel.style.transform =
+      `translate(${translateX}px, ${translateY}px)`;
   }
 
   /** 切换倍速弹层并关闭其他互斥弹层。 */
@@ -808,7 +858,10 @@ export class FloatingControlBar {
         position: absolute;
         top: 86px;
         right: 54px;
-        width: 336px;
+        box-sizing: border-box;
+        width: min(336px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px);
+        overflow: auto;
         padding: 10px;
         border: 1px solid rgb(0 0 0 / 12%);
         border-radius: 10px;
