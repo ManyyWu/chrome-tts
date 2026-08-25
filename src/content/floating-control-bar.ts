@@ -52,6 +52,8 @@ export class FloatingControlBar {
   private isLoading = false;
   private isCollapsed = false;
   private isGloballyEnabled = true;
+  private horizontalPositionRatio: number | null = null;
+  private verticalPositionRatio: number | null = null;
 
   public constructor(actions: FloatingControlBarActions) {
     this.host = document.createElement("div");
@@ -366,6 +368,12 @@ export class FloatingControlBar {
    * 未提供坐标时使用元素现有位置，因此同一方法也可处理窗口缩放后的自动回收。
    */
   private constrainToViewport(requestedLeft?: number, requestedTop?: number): void {
+    // 收起时元素没有布局尺寸。若此时读取 DOMRect，会得到 left=0、width=0，
+    // 随后的约束会误把浮动条位置永久写成左侧安全边距。
+    if (this.host.hidden || this.isCollapsed) {
+      return;
+    }
+
     const currentRect = this.controlBarElement.getBoundingClientRect();
     const safeMargin = 16;
     const visualViewport = window.visualViewport;
@@ -385,14 +393,35 @@ export class FloatingControlBar {
       safeMargin,
       viewportHeight - currentRect.height - safeMargin,
     );
-    const left = Math.min(
-      maximumLeft,
-      Math.max(safeMargin, requestedLeft ?? currentRect.left),
+    const availableHorizontalSpace = maximumLeft - safeMargin;
+    const availableVerticalSpace = maximumTop - safeMargin;
+    const isExplicitMove = requestedLeft !== undefined || requestedTop !== undefined;
+
+    // 拖动时使用请求坐标；缩放和重新展开时使用相对位置。这样靠右、居中、
+    // 靠下等关系不会因视口尺寸变化而退化为旧的绝对像素坐标。
+    const candidateLeft = requestedLeft ?? (
+      this.horizontalPositionRatio === null
+        ? currentRect.left
+        : safeMargin + availableHorizontalSpace * this.horizontalPositionRatio
     );
-    const top = Math.min(
-      maximumTop,
-      Math.max(safeMargin, requestedTop ?? currentRect.top),
+    const candidateTop = requestedTop ?? (
+      this.verticalPositionRatio === null
+        ? currentRect.top
+        : safeMargin + availableVerticalSpace * this.verticalPositionRatio
     );
+    const left = Math.min(maximumLeft, Math.max(safeMargin, candidateLeft));
+    const top = Math.min(maximumTop, Math.max(safeMargin, candidateTop));
+
+    if (isExplicitMove || this.horizontalPositionRatio === null) {
+      this.horizontalPositionRatio = availableHorizontalSpace > 0
+        ? (left - safeMargin) / availableHorizontalSpace
+        : 0;
+    }
+    if (isExplicitMove || this.verticalPositionRatio === null) {
+      this.verticalPositionRatio = availableVerticalSpace > 0
+        ? (top - safeMargin) / availableVerticalSpace
+        : 0;
+    }
 
     this.host.style.right = "auto";
     this.host.style.transform = "none";
@@ -903,6 +932,9 @@ export class FloatingControlBar {
   }
 
   private collapse(): void {
+    // 隐藏前记录当前位置；隐藏后的元素无法提供有效的布局坐标。
+    const currentRect = this.controlBarElement.getBoundingClientRect();
+    this.constrainToViewport(currentRect.left, currentRect.top);
     this.isCollapsed = true;
     this.closeAllPanels();
     this.renderVisibility();
