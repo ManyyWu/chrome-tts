@@ -7,7 +7,8 @@ const EXCLUDED_ANCESTOR_SELECTOR =
   "nav, header, footer, aside, form, dialog, button, input, textarea, select, " +
   "script, style, noscript, template, [hidden], [aria-hidden='true'], " +
   "#chrome-tts-floating-control-bar, #chrome-tts-error-feedback, " +
-  "#chrome-tts-selection-jump-prompt, #chrome-tts-position-overlay";
+  "#chrome-tts-selection-jump-prompt, #chrome-tts-position-overlay, " +
+  "#chrome-tts-collapsed-launcher";
 
 /**
  * 所有已授权网站的保底适配器。

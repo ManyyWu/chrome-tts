@@ -6,14 +6,16 @@
   // src/shared/settings.ts
   var SETTINGS_KEY = "extensionSettings";
   var DEFAULT_SETTINGS = {
-    version: 3,
+    version: 5,
     voiceName: null,
     voiceExtensionId: null,
     lang: null,
     rate: 1,
     volume: 1,
     autoPlaySelection: false,
-    showSelectionJumpPrompt: false
+    showSelectionJumpPrompt: false,
+    playAllVisibleText: false,
+    globalEnabled: true
   };
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -29,14 +31,16 @@
     const rate = typeof stored.rate === "number" && Number.isFinite(stored.rate) ? clamp(Math.round(stored.rate * 10) / 10, 0.5, 1.5) : DEFAULT_SETTINGS.rate;
     const volume = typeof stored.volume === "number" && Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : DEFAULT_SETTINGS.volume;
     return {
-      version: 3,
+      version: 5,
       voiceName: isNullableString(stored.voiceName) ? stored.voiceName : DEFAULT_SETTINGS.voiceName,
       voiceExtensionId: isNullableString(stored.voiceExtensionId) ? stored.voiceExtensionId : DEFAULT_SETTINGS.voiceExtensionId,
       lang: isNullableString(stored.lang) ? stored.lang : DEFAULT_SETTINGS.lang,
       rate,
       volume,
       autoPlaySelection: typeof stored.autoPlaySelection === "boolean" ? stored.autoPlaySelection : DEFAULT_SETTINGS.autoPlaySelection,
-      showSelectionJumpPrompt: typeof stored.showSelectionJumpPrompt === "boolean" ? stored.showSelectionJumpPrompt : DEFAULT_SETTINGS.showSelectionJumpPrompt
+      showSelectionJumpPrompt: typeof stored.showSelectionJumpPrompt === "boolean" ? stored.showSelectionJumpPrompt : DEFAULT_SETTINGS.showSelectionJumpPrompt,
+      playAllVisibleText: typeof stored.playAllVisibleText === "boolean" ? stored.playAllVisibleText : DEFAULT_SETTINGS.playAllVisibleText,
+      globalEnabled: typeof stored.globalEnabled === "boolean" ? stored.globalEnabled : DEFAULT_SETTINGS.globalEnabled
     };
   }
   async function loadSettings() {
@@ -50,7 +54,7 @@
   }
   async function updateSettings(changes) {
     const current = await loadSettings();
-    const settings = normalizeSettings({ ...current, ...changes, version: 3 });
+    const settings = normalizeSettings({ ...current, ...changes, version: 5 });
     await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
     return settings;
   }
@@ -64,6 +68,7 @@
     return element;
   }
   var voiceSelect = requireElement("#voice");
+  var globalEnabledInput = requireElement("#global-enabled");
   var rateInput = requireElement("#rate");
   var rateValue = requireElement("#rate-value");
   var volumeInput = requireElement("#volume");
@@ -71,6 +76,9 @@
   var autoPlaySelectionInput = requireElement("#auto-play-selection");
   var showSelectionJumpPromptInput = requireElement(
     "#show-selection-jump-prompt"
+  );
+  var playAllVisibleTextInput = requireElement(
+    "#play-all-visible-text"
   );
   var errorElement = requireElement("#popup-error");
   var testActions = requireElement("#test-actions");
@@ -154,13 +162,21 @@
     });
   }
   function renderSettings(settings) {
+    globalEnabledInput.checked = settings.globalEnabled;
     rateInput.value = String(settings.rate);
     rateValue.textContent = `${formatRate(settings.rate)}\xD7`;
     volumeInput.value = String(settings.volume);
     volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
     autoPlaySelectionInput.checked = settings.autoPlaySelection;
     showSelectionJumpPromptInput.checked = settings.showSelectionJumpPrompt;
+    playAllVisibleTextInput.checked = settings.playAllVisibleText;
   }
+  globalEnabledInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({ globalEnabled: globalEnabledInput.checked }).catch(
+      showPopupError
+    );
+  });
   function showPopupError(error) {
     errorElement.textContent = error instanceof Error ? error.message : String(error);
     errorElement.hidden = false;
@@ -197,6 +213,12 @@
     clearPopupError();
     void updateSettings({
       showSelectionJumpPrompt: showSelectionJumpPromptInput.checked
+    }).catch(showPopupError);
+  });
+  playAllVisibleTextInput.addEventListener("change", () => {
+    clearPopupError();
+    void updateSettings({
+      playAllVisibleText: playAllVisibleTextInput.checked
     }).catch(showPopupError);
   });
   chrome.tts.onVoicesChanged.addListener(() => {

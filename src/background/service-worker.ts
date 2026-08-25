@@ -236,16 +236,31 @@ async function updatePageQueue(
 ): Promise<void> {
   const previousQueue = pageQueues.get(tabId);
   const storedCursor = previousQueue ? null : await loadPageQueueCursor(tabId);
+  const nextNamespace = getItemNamespace(items[0]?.id);
+  const previousItem = previousQueue?.items[previousQueue.currentIndex];
+  const previousNamespace = getItemNamespace(
+    previousItem?.id ?? storedCursor?.itemId,
+  );
+  const sameAdapterNamespace =
+    previousNamespace === null || previousNamespace === nextNamespace;
   const currentItemId =
-    activePlaybackTabId === tabId && player.getState().source === "page"
+    sameAdapterNamespace &&
+    activePlaybackTabId === tabId &&
+    player.getState().source === "page"
       ? player.getState().itemId
-      : previousQueue?.items[previousQueue.currentIndex]?.id ??
-        storedCursor?.itemId;
+      : sameAdapterNamespace
+        ? previousItem?.id ?? storedCursor?.itemId
+        : null;
   const matchingIndex = currentItemId
     ? items.findIndex((item) => item.id === currentItemId)
     : -1;
   const fallbackIndex = Math.min(
-    Math.max(previousQueue?.currentIndex ?? storedCursor?.index ?? 0, 0),
+    Math.max(
+      sameAdapterNamespace
+        ? previousQueue?.currentIndex ?? storedCursor?.index ?? 0
+        : 0,
+      0,
+    ),
     Math.max(items.length - 1, 0),
   );
 
@@ -253,6 +268,14 @@ async function updatePageQueue(
     items: items.map((item, index) => ({ ...item, index })),
     currentIndex: matchingIndex >= 0 ? matchingIndex : fallbackIndex,
   });
+}
+
+/** 条目 ID 的首段标识生成它的适配器，切换模式时不能沿用旧队列索引。 */
+function getItemNamespace(itemId: string | undefined): string | null {
+  if (!itemId) {
+    return null;
+  }
+  return itemId.split(":", 1)[0] ?? null;
 }
 
 /** 同一标签正在播放时切换暂停/恢复，否则从其当前或第一条开始页面播放。 */

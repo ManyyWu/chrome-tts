@@ -1,5 +1,6 @@
 import { resolvePageAdapter } from "./adapters/adapter-resolver";
 import type { PageAdapter } from "./adapters/types";
+import { VisibleTextAdapter } from "./adapters/visible-text-adapter";
 import {
   type ExtensionEvent,
   type ExtensionRequest,
@@ -54,9 +55,21 @@ if (isSupportedPage(new URL(window.location.href))) {
 }
 
 /** 初始化通用页面队列、QuickPanel、高亮、动态扫描和自动选择播放。 */
-function initializePagePlayback(adapter: PageAdapter): void {
+function initializePagePlayback(defaultAdapter: PageAdapter): void {
   const errorFeedback = new ErrorFeedback();
-  const highlighter = new PageHighlighter(adapter);
+  const visibleTextAdapter = new VisibleTextAdapter();
+  let activeAdapter: PageAdapter = defaultAdapter;
+  // 高亮器始终通过代理访问当前模式，避免修改其既有生命周期和 DOM 映射逻辑。
+  const adapterProxy: PageAdapter = {
+    id: "active-adapter-proxy",
+    priority: 0,
+    matches: (url) => activeAdapter.matches(url),
+    scanTextItems: () => activeAdapter.scanTextItems(),
+    findTextElement: (itemId) => activeAdapter.findTextElement(itemId),
+    findSelectionPosition: (selection) =>
+      activeAdapter.findSelectionPosition(selection),
+  };
+  const highlighter = new PageHighlighter(adapterProxy);
   const selectionJumpPrompt = new SelectionJumpPrompt((position) => {
     void executePageCommand({
       type: "page:play-from-position",
@@ -163,6 +176,10 @@ function initializePagePlayback(adapter: PageAdapter): void {
     latestState = state;
     updatePlayerKeepAlive(state);
     controlBar.renderState(state);
+    if (!settings.globalEnabled) {
+      highlighter.clear();
+      return;
+    }
     if (state.source === "page" && state.itemId) {
       currentItemId = state.itemId;
       if (
@@ -185,6 +202,35 @@ function initializePagePlayback(adapter: PageAdapter): void {
         recoverable: true,
       });
     }
+  }
+
+  /** 全局关闭会隐藏全部入口并停止当前页面拥有的话语，重新开启只恢复界面。 */
+  async function applyGlobalActivation(
+    nextSettings: ExtensionSettings,
+  ): Promise<void> {
+    controlBar.setGlobalEnabled(nextSettings.globalEnabled);
+    if (nextSettings.globalEnabled) {
+      return;
+    }
+
+    selectionJumpPrompt.hide();
+    highlighter.clear();
+    if (
+      latestState.status === "loading" ||
+      latestState.status === "playing" ||
+      latestState.status === "paused"
+    ) {
+      renderPlaybackState(await sendRequest({ type: "player:stop" }));
+    }
+  }
+
+  /** 按固定顺序应用会影响页面运行状态的设置，避免模式切换与全局关闭并发。 */
+  async function applyRuntimeSettings(
+    nextSettings: ExtensionSettings,
+  ): Promise<void> {
+    controlBar.renderSettings(nextSettings);
+    await applyGlobalActivation(nextSettings);
+    await applyTextScanMode(nextSettings);
   }
 
   /** 播放和暂停期间定时向 service worker 发消息，保护长话语的 TTS 事件监听。 */
@@ -261,7 +307,12 @@ function initializePagePlayback(adapter: PageAdapter): void {
 
   /** 扫描结果只有发生实质变化时才发送，避免 MutationObserver 产生无效队列更新。 */
   async function scanPage(): Promise<void> {
-    const nextItems = adapter.scanTextItems();
+    const scanningAdapter = activeAdapter;
+    const nextItems = scanningAdapter.scanTextItems();
+    // 设置切换可能与延迟扫描并发，旧适配器结果不得覆盖新模式队列。
+    if (scanningAdapter !== activeAdapter) {
+      return;
+    }
     const previousSignature = items
       .map((item) => `${item.id}:${item.text}`)
       .join("|");
@@ -277,6 +328,31 @@ function initializePagePlayback(adapter: PageAdapter): void {
     }
   }
 
+  /** 切换扫描模式时停止旧队列并重新扫描；相同模式不做任何操作。 */
+  async function applyTextScanMode(nextSettings: ExtensionSettings): Promise<void> {
+    const nextAdapter = nextSettings.playAllVisibleText
+      ? visibleTextAdapter
+      : defaultAdapter;
+    if (nextAdapter === activeAdapter) {
+      return;
+    }
+
+    if (
+      latestState.status === "loading" ||
+      latestState.status === "playing" ||
+      latestState.status === "paused"
+    ) {
+      renderPlaybackState(await sendRequest({ type: "player:stop" }));
+    }
+    highlighter.clear();
+    selectionJumpPrompt.hide();
+    activeAdapter = nextAdapter;
+    items = [];
+    currentItemId = null;
+    renderNavigation();
+    await scanPage();
+  }
+
   async function saveSettings(
     changes: Partial<Pick<ExtensionSettings, "rate" | "volume">>,
   ): Promise<void> {
@@ -289,12 +365,17 @@ function initializePagePlayback(adapter: PageAdapter): void {
   }
 
   function scheduleSelectionAutoPlay(event: Event): void {
+    if (!settings.globalEnabled) {
+      selectionJumpPrompt.hide();
+      return;
+    }
     const target = event.target;
     if (
       target instanceof Element &&
       target.closest(
         "#chrome-tts-floating-control-bar, #chrome-tts-error-feedback, " +
-          "#chrome-tts-selection-jump-prompt",
+          "#chrome-tts-selection-jump-prompt, " +
+          "#chrome-tts-collapsed-launcher",
       )
     ) {
       return;
@@ -303,7 +384,7 @@ function initializePagePlayback(adapter: PageAdapter): void {
     const capturedText = getSelectedText();
     const selection = window.getSelection();
     const selectionPosition = selection
-      ? adapter.findSelectionPosition(selection)
+      ? activeAdapter.findSelectionPosition(selection)
       : null;
     const selectionRect = getSelectionRect(selection);
     if (capturedText) {
@@ -385,10 +466,12 @@ function initializePagePlayback(adapter: PageAdapter): void {
       void loadSettings()
         .then((nextSettings) => {
           settings = nextSettings;
-          controlBar.renderSettings(nextSettings);
           if (!nextSettings.showSelectionJumpPrompt) {
             selectionJumpPrompt.hide();
           }
+          void applyRuntimeSettings(nextSettings).catch((error: unknown) => {
+            showError(createContentError("APPLY_SETTINGS_FAILED", error));
+          });
         })
         .catch((error: unknown) => {
           showError(createContentError("LOAD_SETTINGS_FAILED", error));
@@ -416,7 +499,7 @@ function initializePagePlayback(adapter: PageAdapter): void {
   void loadSettings()
     .then((loadedSettings) => {
       settings = loadedSettings;
-      controlBar.renderSettings(loadedSettings);
+      return applyRuntimeSettings(loadedSettings);
     })
     .catch((error: unknown) => {
       showError(createContentError("LOAD_SETTINGS_FAILED", error));

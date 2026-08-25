@@ -17,6 +17,7 @@ function requireElement<T extends Element>(selector: string): T {
 }
 
 const voiceSelect = requireElement<HTMLSelectElement>("#voice");
+const globalEnabledInput = requireElement<HTMLInputElement>("#global-enabled");
 const rateInput = requireElement<HTMLInputElement>("#rate");
 const rateValue = requireElement<HTMLOutputElement>("#rate-value");
 const volumeInput = requireElement<HTMLInputElement>("#volume");
@@ -25,6 +26,9 @@ const autoPlaySelectionInput =
   requireElement<HTMLInputElement>("#auto-play-selection");
 const showSelectionJumpPromptInput = requireElement<HTMLInputElement>(
   "#show-selection-jump-prompt",
+);
+const playAllVisibleTextInput = requireElement<HTMLInputElement>(
+  "#play-all-visible-text",
 );
 const errorElement = requireElement<HTMLDivElement>("#popup-error");
 const testActions = requireElement<HTMLDivElement>("#test-actions");
@@ -152,13 +156,22 @@ async function saveSelectedVoice(index: number): Promise<void> {
 
 /** 把设置同步到表单，不触发 change 事件或重复写入 storage。 */
 function renderSettings(settings: ExtensionSettings): void {
+  globalEnabledInput.checked = settings.globalEnabled;
   rateInput.value = String(settings.rate);
   rateValue.textContent = `${formatRate(settings.rate)}×`;
   volumeInput.value = String(settings.volume);
   volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
   autoPlaySelectionInput.checked = settings.autoPlaySelection;
   showSelectionJumpPromptInput.checked = settings.showSelectionJumpPrompt;
+  playAllVisibleTextInput.checked = settings.playAllVisibleText;
 }
+
+globalEnabledInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({ globalEnabled: globalEnabledInput.checked }).catch(
+    showPopupError,
+  );
+});
 
 /** popup 自身错误只在实际发生时显示，不保留常驻 statusElement。 */
 function showPopupError(error: unknown): void {
@@ -203,6 +216,13 @@ showSelectionJumpPromptInput.addEventListener("change", () => {
   clearPopupError();
   void updateSettings({
     showSelectionJumpPrompt: showSelectionJumpPromptInput.checked,
+  }).catch(showPopupError);
+});
+
+playAllVisibleTextInput.addEventListener("change", () => {
+  clearPopupError();
+  void updateSettings({
+    playAllVisibleText: playAllVisibleTextInput.checked,
   }).catch(showPopupError);
 });
 

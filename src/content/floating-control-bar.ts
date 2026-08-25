@@ -11,7 +11,8 @@ type ControlIcon =
   | "speed"
   | "volume"
   | "settings"
-  | "drag";
+  | "drag"
+  | "collapse";
 
 /** 控制栏把界面操作转换成回调，不直接依赖扩展消息或 chrome.tts。 */
 export interface FloatingControlBarActions {
@@ -33,6 +34,7 @@ export interface FloatingControlBarActions {
  */
 export class FloatingControlBar {
   private readonly host: HTMLDivElement;
+  private readonly launcherHost: HTMLDivElement;
   private readonly controlBarElement: HTMLDivElement;
   private readonly playButton: HTMLButtonElement;
   private readonly previousButton: HTMLButtonElement;
@@ -48,6 +50,8 @@ export class FloatingControlBar {
   private currentRate = 1;
   private hasPageItems = false;
   private isLoading = false;
+  private isCollapsed = false;
+  private isGloballyEnabled = true;
 
   public constructor(actions: FloatingControlBarActions) {
     this.host = document.createElement("div");
@@ -55,6 +59,8 @@ export class FloatingControlBar {
 
     const shadowRoot = this.host.attachShadow({ mode: "closed" });
     shadowRoot.append(this.createStyles());
+
+    this.launcherHost = this.createLauncher();
 
     this.controlBarElement = document.createElement("div");
     this.controlBarElement.className = "control-bar";
@@ -69,6 +75,7 @@ export class FloatingControlBar {
     const rateButton = this.createButton("speed", "调整播放速度");
     const volumeButton = this.createButton("volume", "调整音量");
     const settingsButton = this.createButton("settings", "打开设置");
+    const collapseButton = this.createButton("collapse", "收起快捷控制栏");
     const dragButton = this.createButton("drag", "拖动快捷控制栏");
     dragButton.classList.add("drag-button");
 
@@ -80,6 +87,7 @@ export class FloatingControlBar {
     rateButton.addEventListener("click", () => this.toggleRatePanel());
     volumeButton.addEventListener("click", () => this.toggleVolumePanel());
     settingsButton.addEventListener("click", actions.onOpenSettings);
+    collapseButton.addEventListener("click", () => this.collapse());
     this.initializeDragging(dragButton);
 
     this.controlBarElement.append(
@@ -91,6 +99,7 @@ export class FloatingControlBar {
       rateButton,
       volumeButton,
       settingsButton,
+      collapseButton,
       dragButton,
     );
 
@@ -207,6 +216,7 @@ export class FloatingControlBar {
       this.volumePanel,
     );
     document.documentElement.append(this.host);
+    document.documentElement.append(this.launcherHost);
 
     // 拖动后使用固定 left/top；视口缩小时重新约束，避免控制栏留在不可见区域。
     const handleViewportResize = (): void => {
@@ -264,6 +274,15 @@ export class FloatingControlBar {
     this.rateValue.textContent = `${formatRate(settings.rate)}×`;
     this.volumeInput.value = String(settings.volume);
     this.volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
+  }
+
+  /** 全局关闭时同时隐藏完整控制栏和收起后的启动图标。 */
+  public setGlobalEnabled(enabled: boolean): void {
+    this.isGloballyEnabled = enabled;
+    this.renderVisibility();
+    if (!enabled) {
+      this.closeAllPanels();
+    }
   }
 
   /** 在输入层中显示临时提示，第三阶段统一替换为网页顶部错误 toast。 */
@@ -534,6 +553,9 @@ export class FloatingControlBar {
           }
         }
         break;
+      case "collapse":
+        appendShape("path", { d: "m9 5 7 7-7 7" });
+        break;
     }
 
     return svg;
@@ -556,6 +578,10 @@ export class FloatingControlBar {
         transform: translateY(-50%);
         color-scheme: light;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      :host([hidden]) {
+        display: none;
       }
 
       .control-bar {
@@ -813,6 +839,84 @@ export class FloatingControlBar {
       }
     `;
     return style;
+  }
+
+  /** 启动图标使用独立 fixed 宿主，始终固定在窗口右下角且不继承浮动条拖动位置。 */
+  private createLauncher(): HTMLDivElement {
+    const host = document.createElement("div");
+    host.id = "chrome-tts-collapsed-launcher";
+    host.hidden = true;
+    const shadow = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = `
+      :host {
+        all: initial;
+        position: fixed;
+        right: max(16px, env(safe-area-inset-right));
+        bottom: max(16px, env(safe-area-inset-bottom));
+        z-index: 2147483647;
+        display: block;
+        color-scheme: light;
+      }
+      :host([hidden]) {
+        display: none;
+      }
+      button {
+        display: grid;
+        place-items: center;
+        box-sizing: border-box;
+        width: 46px;
+        height: 46px;
+        padding: 7px;
+        border: 1px solid rgb(0 0 0 / 14%);
+        border-radius: 14px;
+        background: rgb(255 255 255 / 96%);
+        box-shadow: 0 5px 20px rgb(0 0 0 / 22%);
+        cursor: pointer;
+      }
+      button:hover {
+        background: #f1f3f4;
+      }
+      button:focus-visible {
+        outline: 3px solid rgb(26 115 232 / 35%);
+        outline-offset: 2px;
+      }
+      img {
+        display: block;
+        width: 32px;
+        height: 32px;
+        object-fit: contain;
+      }
+    `;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.title = "展开 Chrome TTS 快捷控制栏";
+    button.setAttribute("aria-label", "展开 Chrome TTS 快捷控制栏");
+    const icon = document.createElement("img");
+    icon.src = chrome.runtime.getURL("assets/icons/icon-48.png");
+    icon.alt = "";
+    icon.setAttribute("aria-hidden", "true");
+    button.append(icon);
+    button.addEventListener("click", () => this.expand());
+    shadow.append(style, button);
+    return host;
+  }
+
+  private collapse(): void {
+    this.isCollapsed = true;
+    this.closeAllPanels();
+    this.renderVisibility();
+  }
+
+  private expand(): void {
+    this.isCollapsed = false;
+    this.renderVisibility();
+    window.requestAnimationFrame(() => this.constrainToViewport());
+  }
+
+  private renderVisibility(): void {
+    this.host.hidden = !this.isGloballyEnabled || this.isCollapsed;
+    this.launcherHost.hidden = !this.isGloballyEnabled || !this.isCollapsed;
   }
 }
 

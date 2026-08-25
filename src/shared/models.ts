@@ -49,7 +49,7 @@ export interface ExtensionError {
 
 /** 持久化设置的当前结构，version 用于后续迁移旧数据。 */
 export interface ExtensionSettings {
-  version: 3;
+  version: 5;
   voiceName: string | null;
   voiceExtensionId: string | null;
   lang: string | null;
@@ -57,4 +57,6 @@ export interface ExtensionSettings {
   volume: number;
   autoPlaySelection: boolean;
   showSelectionJumpPrompt: boolean;
+  playAllVisibleText: boolean;
+  globalEnabled: boolean;
 }

@@ -5,7 +5,7 @@ export const SETTINGS_KEY = "extensionSettings";
 
 /** 首次安装或存储数据不可用时采用的安全默认设置。 */
 export const DEFAULT_SETTINGS: ExtensionSettings = {
-  version: 3,
+  version: 5,
   voiceName: null,
   voiceExtensionId: null,
   lang: null,
@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   volume: 1,
   autoPlaySelection: false,
   showSelectionJumpPrompt: false,
+  playAllVisibleText: false,
+  globalEnabled: true,
 };
 
 /** 将数值限制在 chrome.tts 允许且本项目支持的范围内。 */
@@ -45,7 +47,7 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       : DEFAULT_SETTINGS.volume;
 
   return {
-    version: 3,
+    version: 5,
     voiceName: isNullableString(stored.voiceName)
       ? stored.voiceName
       : DEFAULT_SETTINGS.voiceName,
@@ -65,6 +67,14 @@ function normalizeSettings(value: unknown): ExtensionSettings {
       typeof stored.showSelectionJumpPrompt === "boolean"
         ? stored.showSelectionJumpPrompt
         : DEFAULT_SETTINGS.showSelectionJumpPrompt,
+    playAllVisibleText:
+      typeof stored.playAllVisibleText === "boolean"
+        ? stored.playAllVisibleText
+        : DEFAULT_SETTINGS.playAllVisibleText,
+    globalEnabled:
+      typeof stored.globalEnabled === "boolean"
+        ? stored.globalEnabled
+        : DEFAULT_SETTINGS.globalEnabled,
   };
 }
 
@@ -86,7 +96,7 @@ export async function updateSettings(
   changes: Partial<Omit<ExtensionSettings, "version">>,
 ): Promise<ExtensionSettings> {
   const current = await loadSettings();
-  const settings = normalizeSettings({ ...current, ...changes, version: 3 });
+  const settings = normalizeSettings({ ...current, ...changes, version: 5 });
 
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
   return settings;
