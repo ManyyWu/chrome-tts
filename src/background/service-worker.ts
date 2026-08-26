@@ -16,15 +16,18 @@ import { TtsPlayer, type SpeechSnapshot } from "./player";
 interface PageQueue {
   items: PageTextItem[];
   currentIndex: number;
+  pageSessionId: string;
 }
 
 interface PausedPlayback extends SpeechSnapshot {
   tabId: number;
+  pageSessionId: string;
 }
 
 interface PageQueueCursor {
   itemId: string;
   index: number;
+  pageSessionId: string;
 }
 
 const PAUSED_PLAYBACK_KEY = "pausedPlayback";
@@ -153,7 +156,7 @@ async function handleRequest(
   switch (request.type) {
     case "page:set-items": {
       const tabId = requireSenderTabId(sender);
-      await updatePageQueue(tabId, request.items);
+      await updatePageQueue(tabId, request.items, request.pageSessionId);
       return { ok: true, state: getStateForTab(tabId) };
     }
     case "page:toggle": {
@@ -206,6 +209,15 @@ async function handleRequest(
         ),
       };
     }
+    case "site:play-caption": {
+      const tabId = requireSenderTabId(sender);
+      return {
+        ok: true,
+        state: await startPlaybackForTab(tabId, () =>
+          player.playText(request.text, "caption"),
+        ),
+      };
+    }
     case "player:stop":
       await clearPausedPlayback();
       return { ok: true, state: player.stop() };
@@ -227,13 +239,37 @@ async function handleRequest(
 async function updatePageQueue(
   tabId: number,
   items: PageTextItem[],
+  pageSessionId: string,
 ): Promise<void> {
   const previousQueue = pageQueues.get(tabId);
   const storedCursor = previousQueue ? null : await loadPageQueueCursor(tabId);
+  const storedPausedPlayback = previousQueue ? null : await loadPausedPlayback();
+  const previousSessionId =
+    previousQueue?.pageSessionId ??
+    storedCursor?.pageSessionId ??
+    (storedPausedPlayback?.tabId === tabId
+      ? storedPausedPlayback.pageSessionId
+      : undefined);
+  const isNewPageSession =
+    previousSessionId !== undefined && previousSessionId !== pageSessionId;
+
+  if (isNewPageSession) {
+    // 新文档主动停止旧 TTS 并清理持久位置，不依赖移动端 tabs.onUpdated 是否触发。
+    if (activePlaybackTabId === tabId || playbackOwnerTabId === tabId) {
+      player.stop();
+      activePlaybackTabId = null;
+      playbackOwnerTabId = null;
+    }
+    await clearPausedPlaybackForTab(tabId);
+    await clearPageQueueCursor(tabId);
+  }
+
+  const reusableQueue = isNewPageSession ? undefined : previousQueue;
+  const reusableCursor = isNewPageSession ? null : storedCursor;
   const nextNamespace = getItemNamespace(items[0]?.id);
-  const previousItem = previousQueue?.items[previousQueue.currentIndex];
+  const previousItem = reusableQueue?.items[reusableQueue.currentIndex];
   const previousNamespace = getItemNamespace(
-    previousItem?.id ?? storedCursor?.itemId,
+    previousItem?.id ?? reusableCursor?.itemId,
   );
   const sameAdapterNamespace =
     previousNamespace === null || previousNamespace === nextNamespace;
@@ -243,7 +279,7 @@ async function updatePageQueue(
     player.getState().source === "page"
       ? player.getState().itemId
       : sameAdapterNamespace
-        ? previousItem?.id ?? storedCursor?.itemId
+        ? previousItem?.id ?? reusableCursor?.itemId
         : null;
   const matchingIndex = currentItemId
     ? items.findIndex((item) => item.id === currentItemId)
@@ -251,7 +287,7 @@ async function updatePageQueue(
   const fallbackIndex = Math.min(
     Math.max(
       sameAdapterNamespace
-        ? previousQueue?.currentIndex ?? storedCursor?.index ?? 0
+        ? reusableQueue?.currentIndex ?? reusableCursor?.index ?? 0
         : 0,
       0,
     ),
@@ -261,6 +297,7 @@ async function updatePageQueue(
   pageQueues.set(tabId, {
     items: items.map((item, index) => ({ ...item, index })),
     currentIndex: matchingIndex >= 0 ? matchingIndex : fallbackIndex,
+    pageSessionId,
   });
 }
 
@@ -456,10 +493,11 @@ async function replayPausedPlayback(
 /** 暂停时把当前标签、实际话语和最近字符位置写入仅本次浏览器会话有效的存储。 */
 async function savePausedPlayback(tabId: number): Promise<void> {
   const speech = player.getSpeechSnapshot();
-  if (!speech) {
+  const pageSessionId = pageQueues.get(tabId)?.pageSessionId;
+  if (!speech || !pageSessionId) {
     return;
   }
-  const pausedPlayback: PausedPlayback = { tabId, ...speech };
+  const pausedPlayback: PausedPlayback = { tabId, pageSessionId, ...speech };
   await chrome.storage.session.set({ [PAUSED_PLAYBACK_KEY]: pausedPlayback });
 }
 
@@ -475,6 +513,9 @@ async function loadPausedPlayback(): Promise<PausedPlayback | null> {
   if (
     typeof record.tabId !== "number" ||
     !Number.isInteger(record.tabId) ||
+    typeof record.pageSessionId !== "string" ||
+    record.pageSessionId.length < 16 ||
+    record.pageSessionId.length > 128 ||
     typeof record.text !== "string" ||
     record.text.length === 0 ||
     !isSpeechSource(record.source) ||
@@ -490,6 +531,7 @@ async function loadPausedPlayback(): Promise<PausedPlayback | null> {
 
   return {
     tabId: record.tabId,
+    pageSessionId: record.pageSessionId,
     text: record.text,
     source: record.source,
     itemId: record.itemId,
@@ -502,7 +544,12 @@ async function loadPausedPlayback(): Promise<PausedPlayback | null> {
 }
 
 function isSpeechSource(value: unknown): value is SpeechSnapshot["source"] {
-  return value === "page" || value === "selection" || value === "input";
+  return (
+    value === "page" ||
+    value === "selection" ||
+    value === "input" ||
+    value === "caption"
+  );
 }
 
 async function clearPausedPlayback(): Promise<void> {
@@ -523,9 +570,13 @@ async function savePageQueueCursor(
   itemId: string,
   index: number,
 ): Promise<void> {
+  const pageSessionId = pageQueues.get(tabId)?.pageSessionId;
+  if (!pageSessionId) {
+    return;
+  }
   const stored = await chrome.storage.session.get(PAGE_QUEUE_CURSORS_KEY);
   const cursors = normalizePageQueueCursors(stored[PAGE_QUEUE_CURSORS_KEY]);
-  cursors[String(tabId)] = { itemId, index };
+  cursors[String(tabId)] = { itemId, index, pageSessionId };
   await chrome.storage.session.set({ [PAGE_QUEUE_CURSORS_KEY]: cursors });
 }
 
@@ -565,9 +616,17 @@ function normalizePageQueueCursors(
       "index" in cursor &&
       typeof cursor.index === "number" &&
       Number.isInteger(cursor.index) &&
-      cursor.index >= 0
+      cursor.index >= 0 &&
+      "pageSessionId" in cursor &&
+      typeof cursor.pageSessionId === "string" &&
+      cursor.pageSessionId.length >= 16 &&
+      cursor.pageSessionId.length <= 128
     ) {
-      normalized[key] = { itemId: cursor.itemId, index: cursor.index };
+      normalized[key] = {
+        itemId: cursor.itemId,
+        index: cursor.index,
+        pageSessionId: cursor.pageSessionId,
+      };
     }
   }
   return normalized;

@@ -128,9 +128,323 @@
     return (hash >>> 0).toString(16).padStart(8, "0");
   }
 
+  // src/content/sites/x-site.ts
+  var TWEET_SELECTOR = 'article[data-testid="tweet"]';
+  var TWEET_TEXT_SELECTOR = '[data-testid="tweetText"]';
+  var USER_NAME_SELECTOR = '[data-testid="User-Name"]';
+  var SHOW_MORE_SELECTOR = '[data-testid="tweet-text-show-more-link"]';
+  var MAX_CACHED_TWEETS = 2e3;
+  var XPageAdapter = class {
+    id = "x";
+    priority = 100;
+    snapshots = /* @__PURE__ */ new Map();
+    orderedIds = [];
+    elementsById = /* @__PURE__ */ new Map();
+    requestedExpansions = /* @__PURE__ */ new WeakSet();
+    baseQueueContextId = "";
+    queueContextRevision = 0;
+    topAnchorTweetId = null;
+    pendingInteractionReset = false;
+    constructor() {
+      document.addEventListener("click", this.handleTimelineControlClick, true);
+    }
+    matches(url) {
+      return url.hostname === "x.com" || url.hostname.endsWith(".x.com");
+    }
+    getQueueContextId() {
+      const base = this.baseQueueContextId || createTimelineContextId();
+      return `${base}:revision-${this.queueContextRevision}`;
+    }
+    /** 扫描当前虚拟窗口，并将新出现的推文合并进不会随 DOM 回收而缩短的队列。 */
+    scanTextItems() {
+      const nextQueueContextId = createTimelineContextId();
+      if (this.baseQueueContextId && this.baseQueueContextId !== nextQueueContextId || this.pendingInteractionReset) {
+        this.resetQueue();
+      }
+      this.pendingInteractionReset = false;
+      this.baseQueueContextId = nextQueueContextId;
+      this.elementsById.clear();
+      const observedIds = [];
+      const visibleTimelineIds = [];
+      const articles = Array.from(
+        document.querySelectorAll(TWEET_SELECTOR)
+      );
+      for (const article of articles) {
+        const visibleTweetId = extractArticleTweetId(article);
+        if (visibleTweetId) {
+          visibleTimelineIds.push(`x:${visibleTweetId}`);
+        }
+        if (this.expandTruncatedTweetContent(article)) {
+          continue;
+        }
+        const extracted = extractTweet(article);
+        if (extracted === null) {
+          continue;
+        }
+        observedIds.push(extracted.snapshot.id);
+        this.snapshots.set(extracted.snapshot.id, extracted.snapshot);
+        this.elementsById.set(extracted.snapshot.id, article);
+      }
+      const firstObservedId = visibleTimelineIds[0] ?? null;
+      const isNearTimelineTop = window.scrollY <= 600;
+      if (isNearTimelineTop && firstObservedId !== null && this.topAnchorTweetId !== null && firstObservedId !== this.topAnchorTweetId) {
+        const currentSnapshots = observedIds.flatMap((id) => {
+          const snapshot = this.snapshots.get(id);
+          return snapshot ? [[id, snapshot]] : [];
+        });
+        this.resetQueue();
+        for (const [id, snapshot] of currentSnapshots) {
+          this.snapshots.set(id, snapshot);
+        }
+      }
+      if (isNearTimelineTop && firstObservedId !== null) {
+        this.topAnchorTweetId = firstObservedId;
+      }
+      this.mergeObservedOrder(observedIds);
+      this.limitCache();
+      return this.orderedIds.flatMap((id, index) => {
+        const snapshot = this.snapshots.get(id);
+        return snapshot ? [{ id, text: snapshot.text, index }] : [];
+      });
+    }
+    /** 排序方式或新推文刷新属于同一标签内的数据源替换，需要在下一次扫描前失效队列。 */
+    handleTimelineControlClick = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      const menuItem = target.closest('[role="menuitem"]');
+      const menuText = normalizeText2(
+        menuItem?.closest('[role="menu"]')?.innerText ?? ""
+      ).toLowerCase();
+      const isSortSelection = menuItem !== null && (menuText.includes("\u6392\u5E8F\u65B9\u5F0F") || menuText.includes("sort by"));
+      const control = target.closest('button, [role="button"]');
+      const controlText = normalizeText2(
+        `${control?.innerText ?? ""} ${control?.getAttribute("aria-label") ?? ""}`
+      ).toLowerCase();
+      const isTimelineRefresh = control !== null && (/新推文|刷新/u.test(controlText) || controlText.includes("new posts") || controlText.includes("show posts") || controlText.includes("refresh"));
+      if (isSortSelection || isTimelineRefresh) {
+        this.pendingInteractionReset = true;
+      }
+    };
+    resetQueue() {
+      this.snapshots.clear();
+      this.orderedIds.splice(0);
+      this.elementsById.clear();
+      this.topAnchorTweetId = null;
+      this.queueContextRevision += 1;
+    }
+    findTextElement(itemId) {
+      const element = this.elementsById.get(itemId) ?? null;
+      return element?.isConnected === true ? element : null;
+    }
+    /** X 默认深色主题的浅色文字在浅绿背景上对比不足，高亮期间改为近黑色。 */
+    getHighlightTextColor(_itemId) {
+      return "#111111";
+    }
+    getTextElementCharOffset(itemId) {
+      return this.snapshots.get(itemId)?.segments[0]?.start ?? 0;
+    }
+    /** 作者、时间和“引用内容”没有正文 DOM；正文位置则映射到主推文或引用正文。 */
+    resolveTextDomPosition(itemId, charIndex) {
+      const segment = this.snapshots.get(itemId)?.segments.find(
+        (candidate) => charIndex >= candidate.start && charIndex < candidate.start + candidate.length
+      );
+      return segment ? { element: segment.element, charIndex: charIndex - segment.start } : null;
+    }
+    /**
+     * “显示更多”按钮存在时，剩余正文尚未进入 tweetText。主正文和引用正文都需要
+     * 完整展开；WeakSet 防止 DOM 更新前的密集扫描重复触发同一按钮。
+     */
+    expandTruncatedTweetContent(article) {
+      const showMoreButtons = Array.from(
+        article.querySelectorAll(SHOW_MORE_SELECTOR)
+      );
+      if (showMoreButtons.length === 0) {
+        return false;
+      }
+      const time = article.querySelector("time");
+      const permalink = time?.closest('a[href*="/status/"]');
+      const tweetId = extractTweetId(permalink?.getAttribute("href") ?? "");
+      if (tweetId) {
+        const itemId = `x:${tweetId}`;
+        this.snapshots.delete(itemId);
+        const itemIndex = this.orderedIds.indexOf(itemId);
+        if (itemIndex >= 0) {
+          this.orderedIds.splice(itemIndex, 1);
+        }
+      }
+      for (const showMoreButton of showMoreButtons) {
+        if (!this.requestedExpansions.has(showMoreButton)) {
+          this.requestedExpansions.add(showMoreButton);
+          showMoreButton.click();
+        }
+      }
+      return true;
+    }
+    /** 选区位于主正文或引用正文时，转换为完整组合话语中的字符位置。 */
+    findSelectionPosition(selection) {
+      if (selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
+      }
+      const range = selection.getRangeAt(0);
+      for (const [itemId, snapshot] of this.snapshots) {
+        for (const segment of snapshot.segments) {
+          if (!segment.element.contains(range.startContainer)) {
+            continue;
+          }
+          const prefixRange = document.createRange();
+          prefixRange.selectNodeContents(segment.element);
+          try {
+            prefixRange.setEnd(range.startContainer, range.startOffset);
+          } catch {
+            return null;
+          }
+          const normalizedPrefix = normalizeText2(prefixRange.toString());
+          return {
+            itemId,
+            charIndex: segment.start + normalizedPrefix.length
+          };
+        }
+      }
+      return null;
+    }
+    /**
+     * 用已知相邻推文作为锚点合并新 ID。向下滚动时追加，向上重新加载时插回已知项
+     * 之前；同一推文无论节点重建多少次都只保留一个队列条目。
+     */
+    mergeObservedOrder(observedIds) {
+      let previousObservedId = null;
+      for (let index = 0; index < observedIds.length; index += 1) {
+        const id = observedIds[index];
+        if (!id) {
+          continue;
+        }
+        if (this.orderedIds.includes(id)) {
+          previousObservedId = id;
+          continue;
+        }
+        const previousIndex = previousObservedId === null ? -1 : this.orderedIds.indexOf(previousObservedId);
+        if (previousIndex >= 0) {
+          this.orderedIds.splice(previousIndex + 1, 0, id);
+        } else {
+          const nextKnownId = observedIds.slice(index + 1).find((candidate) => this.orderedIds.includes(candidate));
+          const nextKnownIndex = nextKnownId ? this.orderedIds.indexOf(nextKnownId) : -1;
+          if (nextKnownIndex >= 0) {
+            this.orderedIds.splice(nextKnownIndex, 0, id);
+          } else {
+            this.orderedIds.push(id);
+          }
+        }
+        previousObservedId = id;
+      }
+    }
+    /** 限制长时间滚动的内存占用；优先淘汰已经不在当前虚拟窗口中的最早条目。 */
+    limitCache() {
+      while (this.orderedIds.length > MAX_CACHED_TWEETS) {
+        const removableIndex = this.orderedIds.findIndex(
+          (id) => !this.elementsById.has(id)
+        );
+        if (removableIndex < 0) {
+          return;
+        }
+        const [removedId] = this.orderedIds.splice(removableIndex, 1);
+        if (removedId) {
+          this.snapshots.delete(removedId);
+        }
+      }
+    }
+  };
+  function extractTweet(article) {
+    const mainTime = article.querySelector("time");
+    const permalink = mainTime?.closest('a[href*="/status/"]');
+    const tweetId = extractTweetId(permalink?.getAttribute("href") ?? "");
+    if (!mainTime || !permalink || !tweetId) {
+      return null;
+    }
+    const textElement = Array.from(
+      article.querySelectorAll(TWEET_TEXT_SELECTOR)
+    ).find((element) => element.closest('[role="link"]') === null) ?? null;
+    if (textElement === null) {
+      return null;
+    }
+    const author = extractAuthor(article);
+    const time = normalizeText2(mainTime.textContent ?? "");
+    const body = normalizeText2(textElement.innerText);
+    if (!author || !time || !body) {
+      return null;
+    }
+    const prefix = `${author}\u3002${time}\u3002`;
+    let speechText = `${prefix}${body}`;
+    const segments = [
+      { element: textElement, start: prefix.length, length: body.length }
+    ];
+    const quotedTextElement = Array.from(
+      article.querySelectorAll(TWEET_TEXT_SELECTOR)
+    ).find((element) => element.closest('[role="link"]') !== null) ?? null;
+    if (quotedTextElement !== null) {
+      const quotedContainer = quotedTextElement.closest('[role="link"]');
+      const quotedTimeElement = quotedContainer?.querySelector("time");
+      const quotedAuthor = quotedContainer ? extractAuthor(quotedContainer) : "";
+      const quotedTime = normalizeText2(quotedTimeElement?.textContent ?? "");
+      const quotedBody = normalizeText2(quotedTextElement.innerText);
+      if (quotedAuthor && quotedTime && quotedBody) {
+        const quoteIntroduction = "\u3002\u5F15\u7528\u5185\u5BB9\u3002";
+        const quotedPrefix = `${quotedAuthor}\u3002${quotedTime}\u3002`;
+        const quotedBodyStart = speechText.length + quoteIntroduction.length + quotedPrefix.length;
+        speechText += `${quoteIntroduction}${quotedPrefix}${quotedBody}`;
+        segments.push({
+          element: quotedTextElement,
+          start: quotedBodyStart,
+          length: quotedBody.length
+        });
+      }
+    }
+    return {
+      snapshot: {
+        id: `x:${tweetId}`,
+        text: speechText,
+        segments
+      }
+    };
+  }
+  function extractAuthor(article) {
+    const userName = article.querySelector(USER_NAME_SELECTOR);
+    const nameLink = userName?.querySelector('a[role="link"]');
+    const linkedName = normalizeText2(nameLink?.innerText ?? "");
+    if (linkedName) {
+      return linkedName;
+    }
+    return (userName?.innerText ?? "").split(/\r?\n/u).map(normalizeText2).find((line) => line && !line.startsWith("@") && line !== "\xB7") ?? "";
+  }
+  function extractTweetId(href) {
+    return href.match(/\/status\/(\d+)(?:$|[/?#])/u)?.[1] ?? null;
+  }
+  function extractArticleTweetId(article) {
+    const time = article.querySelector("time");
+    const permalink = time?.closest('a[href*="/status/"]');
+    return extractTweetId(permalink?.getAttribute("href") ?? "");
+  }
+  function normalizeText2(text) {
+    return text.replace(/\s+/gu, " ").trim();
+  }
+  function createTimelineContextId() {
+    const selectedTab = document.querySelector(
+      '[data-testid="ScrollSnap-List"] [role="tab"][aria-selected="true"]'
+    );
+    const tabList = selectedTab?.closest('[role="tablist"]');
+    const tabs = tabList ? Array.from(tabList.querySelectorAll('[role="tab"]')) : [];
+    const selectedIndex = selectedTab ? tabs.indexOf(selectedTab) : -1;
+    const selectedLabel = normalizeText2(selectedTab?.innerText ?? "none");
+    return `${window.location.pathname}:${selectedIndex}:${selectedLabel}`;
+  }
+
   // src/content/adapters/adapter-resolver.ts
   function resolvePageAdapter(url) {
-    const adapters = [new GenericPageAdapter()];
+    const adapters = [
+      new XPageAdapter(),
+      new GenericPageAdapter()
+    ];
     const matched = adapters.filter((adapter) => adapter.matches(url)).sort((first, second) => second.priority - first.priority)[0];
     if (!matched) {
       throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u7528\u7684\u6587\u672C\u9002\u914D\u5668\u3002");
@@ -180,7 +494,7 @@
       }
       const items = [];
       for (const [element, groupedNodes] of textNodesByGroup) {
-        const text = groupsWithNestedGroups.has(element) ? normalizeText2(groupedNodes.map((node2) => node2.data).join(" ")) : normalizeText2(element.innerText);
+        const text = groupsWithNestedGroups.has(element) ? normalizeText3(groupedNodes.map((node2) => node2.data).join(" ")) : normalizeText3(element.innerText);
         if (!text || text.length > 32768) {
           continue;
         }
@@ -214,7 +528,7 @@
         } catch {
           return null;
         }
-        const fullText = normalizeText2(element.innerText);
+        const fullText = normalizeText3(element.innerText);
         const normalizedPrefix = prefixRange.toString().replace(/\s+/g, " ").trimStart();
         return {
           itemId,
@@ -257,7 +571,7 @@
       return node.parentElement;
     }
   };
-  function normalizeText2(text) {
+  function normalizeText3(text) {
     return text.replace(/\s+/g, " ").trim();
   }
   function createDomPath2(element) {
@@ -343,12 +657,6 @@
     if (JSON.stringify(storedValue) !== JSON.stringify(settings)) {
       await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
     }
-    return settings;
-  }
-  async function updateSettings(changes) {
-    const current = await loadSettings();
-    const settings = normalizeSettings({ ...current, ...changes, version: 6 });
-    await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
     return settings;
   }
 
@@ -468,20 +776,17 @@
     inputPanel;
     textInput;
     inputMessage;
-    ratePanel;
-    rateValue;
-    volumePanel;
-    volumeInput;
-    volumeValue;
+    siteToolPanel;
     settingsOverlayHost;
-    currentRate = 1;
+    siteToolActionVisibility = [];
     hasPageItems = false;
     isLoading = false;
     isCollapsed = false;
     isGloballyEnabled = true;
     horizontalPositionRatio = null;
     verticalPositionRatio = null;
-    constructor(actions) {
+    constructor(actions, siteTools = null, startExpanded = false) {
+      this.isCollapsed = !startExpanded;
       this.host = document.createElement("div");
       this.host.id = "chrome-tts-floating-control-bar";
       const shadowRoot = this.host.attachShadow({ mode: "closed" });
@@ -496,8 +801,6 @@
       this.nextButton = this.createButton("next", "\u64AD\u653E\u4E0B\u4E00\u6761");
       const selectionButton = this.createButton("selection", "\u64AD\u653E\u9009\u4E2D\u6587\u672C");
       const textButton = this.createButton("text", "\u8F93\u5165\u6587\u672C\u5E76\u64AD\u653E");
-      const rateButton = this.createButton("speed", "\u8C03\u6574\u64AD\u653E\u901F\u5EA6");
-      const volumeButton = this.createButton("volume", "\u8C03\u6574\u97F3\u91CF");
       const settingsButton = this.createButton("settings", "\u6253\u5F00\u8BBE\u7F6E");
       const collapseButton = this.createButton("collapse", "\u6536\u8D77\u5FEB\u6377\u63A7\u5236\u680F");
       const dragButton = this.createButton("drag", "\u62D6\u52A8\u5FEB\u6377\u63A7\u5236\u680F");
@@ -507,19 +810,20 @@
       this.nextButton.addEventListener("click", actions.onNext);
       selectionButton.addEventListener("click", actions.onPlaySelection);
       textButton.addEventListener("click", () => this.toggleInputPanel());
-      rateButton.addEventListener("click", () => this.toggleRatePanel());
-      volumeButton.addEventListener("click", () => this.toggleVolumePanel());
       settingsButton.addEventListener("click", () => this.openSettingsPanel());
       collapseButton.addEventListener("click", () => this.collapse());
       this.initializeDragging(dragButton);
+      if (siteTools !== null) {
+        const siteToolsButton = this.createButton("site-tools", siteTools.title);
+        siteToolsButton.addEventListener("click", () => this.toggleSiteToolPanel());
+        this.controlBarElement.append(siteToolsButton);
+      }
       this.controlBarElement.append(
         this.previousButton,
         this.playButton,
         this.nextButton,
         selectionButton,
         textButton,
-        rateButton,
-        volumeButton,
         settingsButton,
         collapseButton,
         dragButton
@@ -561,72 +865,41 @@
       this.inputMessage.className = "input-message";
       this.inputMessage.setAttribute("role", "status");
       this.inputPanel.append(this.textInput, actionRow, this.inputMessage);
-      this.ratePanel = document.createElement("div");
-      this.ratePanel.className = "setting-panel rate-panel";
-      this.ratePanel.hidden = true;
-      const rateAdjustmentRow = document.createElement("div");
-      rateAdjustmentRow.className = "adjustment-row";
-      const decreaseRateButton = this.createAdjustmentButton("\u2212", "\u8BED\u901F\u964D\u4F4E 0.1");
-      const increaseRateButton = this.createAdjustmentButton("+", "\u8BED\u901F\u63D0\u9AD8 0.1");
-      this.rateValue = document.createElement("output");
-      this.rateValue.className = "setting-value";
-      this.rateValue.textContent = "1\xD7";
-      decreaseRateButton.addEventListener("click", () => {
-        this.changeRate(this.currentRate - 0.1, actions);
-      });
-      increaseRateButton.addEventListener("click", () => {
-        this.changeRate(this.currentRate + 0.1, actions);
-      });
-      rateAdjustmentRow.append(
-        decreaseRateButton,
-        this.rateValue,
-        increaseRateButton
-      );
-      const presetRow = document.createElement("div");
-      presetRow.className = "preset-row";
-      for (const preset of [0.5, 1, 1.5]) {
-        const presetButton = document.createElement("button");
-        presetButton.type = "button";
-        presetButton.className = "preset-button";
-        presetButton.textContent = `${preset}\xD7`;
-        presetButton.addEventListener("click", () => {
-          this.changeRate(preset, actions);
-        });
-        presetRow.append(presetButton);
+      this.siteToolPanel = document.createElement("div");
+      this.siteToolPanel.className = "site-tool-panel";
+      this.siteToolPanel.hidden = true;
+      if (siteTools !== null) {
+        this.siteToolPanel.setAttribute("aria-label", siteTools.title);
+        for (const action of siteTools.actions) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "site-tool-action";
+          button.textContent = action.label;
+          button.title = action.description;
+          if (action.isAvailable) {
+            this.siteToolActionVisibility.push({
+              button,
+              isAvailable: action.isAvailable
+            });
+            button.hidden = !action.isAvailable();
+          }
+          button.addEventListener("click", () => {
+            this.siteToolPanel.hidden = true;
+            action.activate();
+          });
+          this.siteToolPanel.append(button);
+        }
       }
-      this.ratePanel.append(rateAdjustmentRow, presetRow);
-      this.volumePanel = document.createElement("div");
-      this.volumePanel.className = "setting-panel volume-panel";
-      this.volumePanel.hidden = true;
-      this.volumeInput = document.createElement("input");
-      this.volumeInput.type = "range";
-      this.volumeInput.min = "0";
-      this.volumeInput.max = "1";
-      this.volumeInput.step = "0.05";
-      this.volumeInput.value = "1";
-      this.volumeInput.setAttribute("aria-label", "\u64AD\u653E\u97F3\u91CF");
-      this.volumeValue = document.createElement("output");
-      this.volumeValue.className = "volume-value";
-      this.volumeValue.textContent = "100%";
-      this.volumeInput.addEventListener("input", () => {
-        const volume = Number(this.volumeInput.value);
-        this.volumeValue.textContent = `${Math.round(volume * 100)}%`;
-      });
-      this.volumeInput.addEventListener("change", () => {
-        const volume = Number(this.volumeInput.value);
-        actions.onVolumeChange(volume);
-      });
-      this.volumePanel.append(this.volumeInput, this.volumeValue);
       this.settingsOverlayHost = this.createSettingsOverlay();
       shadowRoot.append(
         this.controlBarElement,
         this.inputPanel,
-        this.ratePanel,
-        this.volumePanel
+        this.siteToolPanel
       );
       document.documentElement.append(this.host);
       document.documentElement.append(this.launcherHost);
       document.documentElement.append(this.settingsOverlayHost);
+      this.renderVisibility();
       const handleViewportResize = () => {
         window.requestAnimationFrame(() => {
           this.constrainToViewport();
@@ -671,13 +944,6 @@
       this.nextButton.disabled = total === 0 || currentIndex >= total - 1;
       this.playButton.disabled = !this.hasPageItems || this.isLoading;
     }
-    /** 将 storage 中的倍速和音量同步到控制栏，不触发保存回调。 */
-    renderSettings(settings) {
-      this.currentRate = settings.rate;
-      this.rateValue.textContent = `${formatRate(settings.rate)}\xD7`;
-      this.volumeInput.value = String(settings.volume);
-      this.volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
-    }
     /** 全局关闭时同时隐藏完整控制栏和收起后的启动图标。 */
     setGlobalEnabled(enabled) {
       this.isGloballyEnabled = enabled;
@@ -696,16 +962,6 @@
       button.type = "button";
       button.className = "control-button";
       button.append(this.createIcon(icon));
-      button.title = description;
-      button.setAttribute("aria-label", description);
-      return button;
-    }
-    /** 创建倍速微调按钮；弹层控件使用文字可直接表达增减方向。 */
-    createAdjustmentButton(label, description) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "adjustment-button";
-      button.textContent = label;
       button.title = description;
       button.setAttribute("aria-label", description);
       return button;
@@ -793,8 +1049,7 @@
     }
     /** 展开或关闭文本输入层，并在展开后把键盘焦点移到文本框。 */
     toggleInputPanel() {
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.inputPanel.hidden = !this.inputPanel.hidden;
       this.showInputMessage("");
       if (!this.inputPanel.hidden) {
@@ -840,30 +1095,24 @@
       }
       this.inputPanel.style.transform = `translate(${translateX}px, ${translateY}px)`;
     }
-    /** 切换倍速弹层并关闭其他互斥弹层。 */
-    toggleRatePanel() {
+    /** 切换当前网站提供的工具面板，并关闭其他互斥弹层。 */
+    toggleSiteToolPanel() {
       this.inputPanel.hidden = true;
-      this.volumePanel.hidden = true;
-      this.ratePanel.hidden = !this.ratePanel.hidden;
+      for (const action of this.siteToolActionVisibility) {
+        action.button.hidden = !action.isAvailable();
+      }
+      this.siteToolPanel.hidden = !this.siteToolPanel.hidden;
     }
-    /** 切换音量弹层并关闭其他互斥弹层。 */
-    toggleVolumePanel() {
-      this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = !this.volumePanel.hidden;
-    }
-    /** 关闭文本输入、倍速和音量三个互斥弹层。 */
+    /** 关闭浮动条内所有弹层以及独立设置遮罩。 */
     closeAllPanels() {
       this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.settingsOverlayHost.hidden = true;
     }
     /** 在网页上方打开通用设置页，绕过 Edge Android 不可用的 action.openPopup。 */
     openSettingsPanel() {
       this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.settingsOverlayHost.hidden = false;
     }
     /**
@@ -962,13 +1211,6 @@
       });
       return overlayHost;
     }
-    /** 将微调结果限制在 0.5–1.5，并消除小数累加产生的浮点误差。 */
-    changeRate(requestedRate, actions) {
-      const rate = Math.round(Math.min(1.5, Math.max(0.5, requestedRate)) * 10) / 10;
-      this.currentRate = rate;
-      this.rateValue.textContent = `${formatRate(rate)}\xD7`;
-      actions.onRateChange(rate);
-    }
     /**
      * 在用户点击后读取系统剪贴板并覆盖文本框内容。
      * clipboardRead 权限只用于这次显式操作；读取失败时保留原文本并显示原因。
@@ -1046,21 +1288,18 @@
           appendShape("rect", { x: "5", y: "3", width: "14", height: "18", rx: "2" });
           appendShape("path", { d: "M8 8h8M8 12h8M8 16h5" });
           break;
-        case "speed":
-          appendShape("path", { d: "M4.93 19.07a10 10 0 1 1 14.14 0" });
-          appendShape("path", { d: "m12 12 4-4" });
-          appendShape("circle", { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" });
-          break;
-        case "volume":
-          appendShape("path", { d: "M5 10v4h3l4 4V6L8 10z", fill: "currentColor", stroke: "none" });
-          appendShape("path", { d: "M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" });
-          break;
         case "settings":
           appendShape("path", {
             d: "M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.07-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94L14.38 2.8a.49.49 0 0 0-.49-.4h-3.84a.49.49 0 0 0-.49.4L9.2 5.34c-.58.24-1.12.55-1.62.94L5.19 5.32a.49.49 0 0 0-.61.22L2.66 8.86a.49.49 0 0 0 .12.64l2.03 1.58c-.05.31-.08.64-.08.96s.03.63.08.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.23.4.32.61.22l2.39-.96c.5.39 1.04.71 1.62.94l.36 2.54c.04.24.24.4.49.4h3.84c.25 0 .45-.16.49-.4l.36-2.54c.58-.24 1.12-.55 1.62-.94l2.39.96c.23.08.49 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z",
             fill: "currentColor",
             stroke: "none"
           });
+          break;
+        case "site-tools":
+          appendShape("rect", { x: "4", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "14", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "4", y: "14", width: "6", height: "6", rx: "1" });
+          appendShape("path", { d: "M14 17h6M17 14v6" });
           break;
         case "drag":
           for (const x of [9, 15]) {
@@ -1194,10 +1433,14 @@
         display: none;
       }
 
-      .setting-panel {
+      .site-tool-panel {
         position: absolute;
+        top: 0;
         right: 54px;
+        display: grid;
+        gap: 7px;
         box-sizing: border-box;
+        width: 180px;
         padding: 10px;
         border: 1px solid rgb(0 0 0 / 12%);
         border-radius: 10px;
@@ -1205,79 +1448,26 @@
         box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
       }
 
-      .setting-panel[hidden] {
+      .site-tool-panel[hidden] {
         display: none;
       }
 
-      .rate-panel {
-        top: 126px;
-        width: 280px;
-      }
-
-      .volume-panel {
-        top: 170px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        width: 250px;
-      }
-
-      .adjustment-row {
-        display: grid;
-        grid-template-columns: 38px 1fr 38px;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .adjustment-button,
-      .preset-button {
+      .site-tool-action {
         box-sizing: border-box;
+        width: 100%;
+        min-height: 36px;
+        padding: 8px 10px;
         border: 0;
         border-radius: 7px;
         color: #202124;
         background: #f1f3f4;
         cursor: pointer;
-        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font: 600 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: left;
       }
 
-      .adjustment-button {
-        height: 34px;
-        font-size: 20px;
-      }
-
-      .setting-value {
-        text-align: center;
-        font-size: 15px;
-        font-weight: 600;
-      }
-
-      .preset-row {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 5px;
-        margin-top: 8px;
-      }
-
-      .preset-button {
-        padding: 8px 3px;
-      }
-
-      .adjustment-button:hover,
-      .preset-button:hover {
+      .site-tool-action:hover {
         background: #e3e7ea;
-      }
-
-      .volume-panel input[type="range"] {
-        flex: 1;
-        min-width: 0;
-        accent-color: #1a73e8;
-      }
-
-      .volume-value {
-        flex: 0 0 42px;
-        text-align: right;
-        font-size: 13px;
-        font-weight: 600;
       }
 
       textarea {
@@ -1434,15 +1624,14 @@
       this.launcherHost.hidden = !this.isGloballyEnabled || !this.isCollapsed;
     }
   };
-  function formatRate(rate) {
-    return Number(rate.toFixed(2)).toString();
-  }
 
   // src/content/page-highlighter.ts
   var CURRENT_CLASS = "chrome-tts-current-text";
   var STYLE_ID = "chrome-tts-page-highlight-style";
   var POSITION_HIGHLIGHT_NAME = "chrome-tts-current-position";
   var POSITION_OVERLAY_ID = "chrome-tts-position-overlay";
+  var TEXT_COLOR_ATTRIBUTE = "data-chrome-tts-highlight-text-color";
+  var TEXT_COLOR_VARIABLE = "--chrome-tts-highlight-text-color";
   var PageHighlighter = class {
     constructor(adapter) {
       this.adapter = adapter;
@@ -1481,6 +1670,10 @@
           background: ${backgroundColor} !important;
           transition: background-color 120ms ease, outline-color 120ms ease !important;
         }
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}],
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}] * {
+          color: var(${TEXT_COLOR_VARIABLE}) !important;
+        }
         ::highlight(${POSITION_HIGHLIGHT_NAME}) {
           color: #063c2b;
           background-color: #6ee7b7;
@@ -1498,8 +1691,9 @@
       const itemChanged = itemId !== this.currentItemId || element !== this.currentElement;
       if (itemChanged) {
         this.clearPosition();
-        this.currentElement?.classList.remove(CURRENT_CLASS);
+        this.removeCurrentElementStyles();
         element.classList.add(CURRENT_CLASS);
+        this.applyTextColor(element, itemId);
         element.scrollIntoView({ behavior: "smooth", block: "center" });
         this.currentElement = element;
         this.currentItemId = itemId;
@@ -1507,19 +1701,36 @@
     }
     /** 按规范化文本索引高亮当前字或词；使用 Range，不插入 span，不破坏网站框架状态。 */
     highlightPosition(itemId, charIndex, length) {
-      const element = this.adapter.findTextElement(itemId);
+      const rootElement = this.adapter.findTextElement(itemId);
       const registry = getHighlightRegistry();
-      if (!element) {
+      if (!rootElement) {
         return;
       }
+      const resolvedPosition = this.adapter.resolveTextDomPosition?.(
+        itemId,
+        charIndex
+      );
+      if (this.adapter.resolveTextDomPosition && resolvedPosition === null) {
+        registry?.delete(POSITION_HIGHLIGHT_NAME);
+        this.positionOverlay.replaceChildren();
+        return;
+      }
+      const element = resolvedPosition?.element ?? rootElement;
       if (element !== this.mappedElement) {
         this.mappedElement = element;
         this.characterMap = createNormalizedCharacterMap(element);
       }
+      const textElementOffset = this.adapter.getTextElementCharOffset?.(itemId) ?? 0;
+      const elementCharIndex = resolvedPosition?.charIndex ?? charIndex - textElementOffset;
+      if (elementCharIndex < 0) {
+        registry?.delete(POSITION_HIGHLIGHT_NAME);
+        this.positionOverlay.replaceChildren();
+        return;
+      }
       const characters = this.characterMap;
       const startIndex = Math.min(
         characters.length - 1,
-        Math.max(0, Math.trunc(charIndex))
+        Math.max(0, Math.trunc(elementCharIndex))
       );
       if (startIndex < 0) {
         return;
@@ -1542,7 +1753,7 @@
     /** 清除当前正文高亮，同时忘记 DOM 引用，下一次播放同一条时仍会重新高亮。 */
     clear() {
       this.clearPosition();
-      this.currentElement?.classList.remove(CURRENT_CLASS);
+      this.removeCurrentElementStyles();
       this.currentElement = null;
       this.currentItemId = null;
       this.mappedElement = null;
@@ -1588,10 +1799,25 @@
       const replacement = this.adapter.findTextElement(this.currentItemId);
       if (replacement && replacement !== this.currentElement) {
         this.clearPosition();
-        this.currentElement?.classList.remove(CURRENT_CLASS);
+        this.removeCurrentElementStyles();
         replacement.classList.add(CURRENT_CLASS);
+        this.applyTextColor(replacement, this.currentItemId);
         this.currentElement = replacement;
       }
+    }
+    /** 仅当当前适配器明确要求时设置颜色变量，通用页面不产生额外样式覆盖。 */
+    applyTextColor(element, itemId) {
+      const color = this.adapter.getHighlightTextColor?.(itemId) ?? null;
+      if (!color) {
+        return;
+      }
+      element.setAttribute(TEXT_COLOR_ATTRIBUTE, "");
+      element.style.setProperty(TEXT_COLOR_VARIABLE, color);
+    }
+    removeCurrentElementStyles() {
+      this.currentElement?.classList.remove(CURRENT_CLASS);
+      this.currentElement?.removeAttribute(TEXT_COLOR_ATTRIBUTE);
+      this.currentElement?.style.removeProperty(TEXT_COLOR_VARIABLE);
     }
   };
   function getHighlightRegistry() {
@@ -1725,6 +1951,562 @@
     }
   };
 
+  // src/content/sites/end-gfw-site.ts
+  var END_GFW_TWEET_SELECTOR = 'article[id][itemscope][itemtype="http://schema.org/SocialMediaPosting"]';
+  var endGfwSiteIntegration = {
+    id: "end-gfw",
+    matches: (url) => url.hostname === "end-gfw.com",
+    create(url, context) {
+      const toolPanel = createTweetPageToolPanel(url, context);
+      return {
+        // 该站点明确要求进入页面时直接展示浮动条。
+        startExpanded: true,
+        ...toolPanel ? { toolPanel } : {}
+      };
+    }
+  };
+  function createTweetPageToolPanel(url, context) {
+    const date = parseEndGfwDate(url);
+    if (url.pathname !== "/tweet-page" || !date) {
+      return null;
+    }
+    return {
+      title: "End GFW \u5DE5\u5177",
+      actions: [
+        {
+          id: "copy-tweet-id",
+          label: "\u590D\u5236\u63A8\u6587 ID",
+          description: "\u590D\u5236\u5F53\u524D\u64AD\u653E\u6216\u5F53\u524D\u53EF\u89C1\u63A8\u6587\u7684 ID",
+          activate: () => {
+            void copyCurrentTweetId(context).catch((error) => {
+              context.reportError(createSiteToolError("COPY_TWEET_ID_FAILED", error));
+            });
+          }
+        },
+        {
+          id: "previous-day",
+          label: "\u4E0A\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0A\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, -1)
+        },
+        {
+          id: "next-day",
+          label: "\u4E0B\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0B\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, 1)
+        }
+      ]
+    };
+  }
+  function parseEndGfwDate(url) {
+    const year = Number(url.searchParams.get("year"));
+    const month = Number(url.searchParams.get("month"));
+    const day = Number(url.searchParams.get("day"));
+    if (![year, month, day].every(Number.isInteger)) {
+      return null;
+    }
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month && date.getUTCDate() === day ? { year, month, day } : null;
+  }
+  function navigateToAdjacentDay(currentUrl, currentDate, offset) {
+    const date = new Date(
+      Date.UTC(currentDate.year, currentDate.month - 1, currentDate.day)
+    );
+    date.setUTCDate(date.getUTCDate() + offset);
+    const targetUrl = new URL(currentUrl.href);
+    targetUrl.searchParams.set("year", String(date.getUTCFullYear()));
+    targetUrl.searchParams.set(
+      "month",
+      String(date.getUTCMonth() + 1).padStart(2, "0")
+    );
+    targetUrl.searchParams.set("day", String(date.getUTCDate()).padStart(2, "0"));
+    window.location.assign(targetUrl.href);
+  }
+  async function copyCurrentTweetId(context) {
+    const currentArticle = context.getCurrentTextElement()?.closest(END_GFW_TWEET_SELECTOR);
+    const article = currentArticle ?? findNearestVisibleTweet();
+    const tweetId = article?.id.trim() ?? "";
+    if (!/^\d+$/u.test(tweetId)) {
+      throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u63D0\u53D6\u7684\u63A8\u6587 ID\u3002");
+    }
+    await writeClipboardText(tweetId);
+  }
+  function findNearestVisibleTweet() {
+    const viewportCenter = (window.visualViewport?.height ?? window.innerHeight) / 2;
+    let nearestArticle = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    const articles = Array.from(
+      document.querySelectorAll(END_GFW_TWEET_SELECTOR)
+    );
+    for (const article of articles) {
+      const rect = article.getBoundingClientRect();
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) {
+        continue;
+      }
+      const distance = Math.abs(rect.top + rect.height / 2 - viewportCenter);
+      if (distance < nearestDistance) {
+        nearestArticle = article;
+        nearestDistance = distance;
+      }
+    }
+    return nearestArticle;
+  }
+  async function writeClipboardText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.readOnly = true;
+      Object.assign(input.style, {
+        position: "fixed",
+        left: "-10000px",
+        top: "0"
+      });
+      document.documentElement.append(input);
+      input.select();
+      const copied = document.execCommand("copy");
+      input.remove();
+      if (!copied) {
+        throw new Error("\u590D\u5236\u63A8\u6587 ID \u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u6D4F\u89C8\u5668\u526A\u8D34\u677F\u6743\u9650\u3002");
+      }
+    }
+  }
+  function createSiteToolError(code, error) {
+    return {
+      code,
+      message: error instanceof Error ? error.message : String(error),
+      source: "content",
+      recoverable: true
+    };
+  }
+
+  // src/content/sites/youtube-site.ts
+  var CAPTION_SEGMENT_SELECTOR = ".ytp-caption-window-container .ytp-caption-segment";
+  var YOUTUBE_NAVIGATION_START_EVENT = "yt-navigate-start";
+  var youtubeSiteIntegration = {
+    id: "youtube",
+    matches: (url) => isYoutubeHost(url.hostname),
+    create(_url, context) {
+      const reader = new YoutubeCaptionReader(context);
+      return {
+        // YouTube 的单页路由不会重新注入 content script，工具入口需在整个站点保持可用。
+        toolPanel: createToolPanel(reader),
+        start: () => reader.start(),
+        stop: () => reader.stop()
+      };
+    }
+  };
+  function createToolPanel(reader) {
+    return {
+      title: "YouTube \u5B57\u5E55\u5DE5\u5177",
+      actions: [
+        {
+          id: "start-caption-reading",
+          label: "\u5F00\u542F\u5B57\u5E55\u6717\u8BFB",
+          description: "\u6717\u8BFB\u64AD\u653E\u5668\u4E2D\u5F53\u524D\u53CA\u540E\u7EED\u663E\u793A\u7684\u5B57\u5E55",
+          activate: () => reader.enable()
+        },
+        {
+          id: "stop-caption-reading",
+          label: "\u505C\u6B62\u5B57\u5E55\u6717\u8BFB",
+          description: "\u505C\u6B62\u76D1\u542C\u5B57\u5E55\u5E76\u505C\u6B62\u5F53\u524D\u5B57\u5E55\u8BED\u97F3",
+          activate: () => reader.disable()
+        },
+        {
+          id: "select-simplified-chinese-captions",
+          label: "\u5207\u6362\u7B80\u4F53\u4E2D\u6587\u5B57\u5E55",
+          description: "\u81EA\u52A8\u9009\u62E9\u5B57\u5E55\u3001\u81EA\u52A8\u7FFB\u8BD1\u3001\u4E2D\u6587\uFF08\u7B80\u4F53\uFF09",
+          isAvailable: () => reader.hasAvailableCaptions(),
+          activate: () => {
+            void reader.selectSimplifiedChineseCaptions();
+          }
+        }
+      ]
+    };
+  }
+  var YoutubeCaptionReader = class {
+    constructor(context) {
+      this.context = context;
+    }
+    observer = null;
+    captionReadTimer = null;
+    enabled = false;
+    previousCaption = "";
+    pendingCaption = "";
+    captionSpeechActive = false;
+    unsubscribePlaybackState = null;
+    /** 单页导航事件负责重新绑定播放器，避免长期观察整个 YouTube 文档。 */
+    start() {
+      this.unsubscribePlaybackState = this.context.subscribePlaybackState(
+        (state) => this.handlePlaybackState(state)
+      );
+      document.addEventListener(
+        YOUTUBE_NAVIGATION_START_EVENT,
+        this.handleNavigationStart
+      );
+    }
+    stop() {
+      this.disable();
+      this.unsubscribePlaybackState?.();
+      this.unsubscribePlaybackState = null;
+      this.observer?.disconnect();
+      this.observer = null;
+      document.removeEventListener(
+        YOUTUBE_NAVIGATION_START_EVENT,
+        this.handleNavigationStart
+      );
+    }
+    /** 开启时要求播放器已经启用字幕，避免按钮成功但页面实际上没有字幕来源。 */
+    enable() {
+      if (!isWatchPage(new URL(window.location.href))) {
+        this.report("YOUTUBE_NOT_WATCH_PAGE", "\u8BF7\u5148\u6253\u5F00 YouTube \u89C6\u9891\u64AD\u653E\u9875\u3002");
+        return;
+      }
+      if (document.querySelector(CAPTION_SEGMENT_SELECTOR) === null) {
+        this.report(
+          "YOUTUBE_CAPTION_NOT_VISIBLE",
+          "\u6CA1\u6709\u68C0\u6D4B\u5230\u5B57\u5E55\uFF0C\u8BF7\u5148\u5728 YouTube \u64AD\u653E\u5668\u4E2D\u5F00\u542F\u5B57\u5E55\u3002"
+        );
+        return;
+      }
+      this.enabled = true;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.connectCaptionObserver();
+      this.scheduleCaptionRead();
+    }
+    disable() {
+      const wasEnabled = this.enabled;
+      this.enabled = false;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.observer?.disconnect();
+      this.observer = null;
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+        this.captionReadTimer = null;
+      }
+      if (wasEnabled) {
+        this.context.stopPlayback();
+      }
+    }
+    /** 仅当当前播放器公开可用的 CC 按钮时显示翻译入口。 */
+    hasAvailableCaptions() {
+      const button = document.querySelector(
+        ".ytp-subtitles-button"
+      );
+      return button !== null && !button.disabled && button.getAttribute("aria-disabled") !== "true";
+    }
+    /**
+     * 依次操作播放器的设置、字幕和自动翻译菜单。YouTube 没有公开字幕翻译 API，
+     * 因此这里使用可见菜单结构；标签匹配同时兼容中英文界面和全角/半角括号。
+     */
+    async selectSimplifiedChineseCaptions() {
+      try {
+        if (!isWatchPage(new URL(window.location.href))) {
+          throw new Error("\u8BF7\u5148\u6253\u5F00 YouTube \u89C6\u9891\u64AD\u653E\u9875\u3002");
+        }
+        const captionButton = document.querySelector(
+          ".ytp-subtitles-button"
+        );
+        if (captionButton === null || captionButton.disabled || captionButton.getAttribute("aria-disabled") === "true") {
+          throw new Error("\u5F53\u524D\u89C6\u9891\u6CA1\u6709\u53EF\u7528\u5B57\u5E55\u3002");
+        }
+        if (captionButton.getAttribute("aria-pressed") !== "true") {
+          captionButton.click();
+          await waitForCondition(
+            () => captionButton.getAttribute("aria-pressed") === "true",
+            "\u5B57\u5E55\u672A\u80FD\u5F00\u542F\uFF0C\u8BF7\u5148\u624B\u52A8\u70B9\u51FB\u64AD\u653E\u5668\u7684 CC \u6309\u94AE\u3002"
+          );
+        }
+        const settingsButton = document.querySelector(
+          ".ytp-settings-button"
+        );
+        if (settingsButton === null) {
+          throw new Error("\u6CA1\u6709\u627E\u5230 YouTube \u64AD\u653E\u5668\u8BBE\u7F6E\u6309\u94AE\u3002");
+        }
+        settingsButton.click();
+        const subtitleItem = await waitForMenuItem(
+          isSubtitleMenuLabel,
+          "\u8BBE\u7F6E\u83DC\u5355\u4E2D\u6CA1\u6709\u627E\u5230\u5B57\u5E55\u9009\u9879\u3002"
+        );
+        subtitleItem.click();
+        const subtitleChoices = await waitForValue(
+          () => {
+            const items = getVisibleMenuItems();
+            return items.some((item) => {
+              const label = getMenuItemLabel(item);
+              return isSimplifiedChineseLabel(label) || isAutoTranslateLabel(label);
+            }) ? items : null;
+          },
+          3e3
+        );
+        if (subtitleChoices === null) {
+          throw new Error("\u5B57\u5E55\u5217\u8868\u6CA1\u6709\u5C55\u5F00\uFF0C\u6216\u5176\u4E2D\u6CA1\u6709\u81EA\u52A8\u7FFB\u8BD1\u9009\u9879\u3002");
+        }
+        const directChineseItem = subtitleChoices.find(
+          (item) => isSimplifiedChineseLabel(getMenuItemLabel(item))
+        ) ?? null;
+        if (directChineseItem !== null) {
+          directChineseItem.click();
+          return;
+        }
+        const autoTranslateItem = subtitleChoices.find(
+          (item) => isAutoTranslateLabel(getMenuItemLabel(item))
+        );
+        if (!autoTranslateItem) {
+          throw new Error("\u5B57\u5E55\u83DC\u5355\u4E2D\u6CA1\u6709\u81EA\u52A8\u7FFB\u8BD1\u9009\u9879\u3002");
+        }
+        autoTranslateItem.click();
+        const simplifiedChineseItem = await waitForMenuItem(
+          isSimplifiedChineseLabel,
+          "\u81EA\u52A8\u7FFB\u8BD1\u8BED\u8A00\u5217\u8868\u4E2D\u6CA1\u6709\u627E\u5230\u4E2D\u6587\uFF08\u7B80\u4F53\uFF09\u3002",
+          true
+        );
+        simplifiedChineseItem.click();
+      } catch (error) {
+        this.report(
+          "YOUTUBE_SELECT_CHINESE_CAPTION_FAILED",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    handleNavigationStart = () => {
+      const wasEnabled = this.enabled;
+      this.enabled = false;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.observer?.disconnect();
+      this.observer = null;
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+        this.captionReadTimer = null;
+      }
+      if (wasEnabled) {
+        this.context.stopPlayback();
+      }
+    };
+    /** 字幕容器会随视频切换而销毁，因此每次启用或导航完成后重新建立观察器。 */
+    connectCaptionObserver() {
+      this.observer?.disconnect();
+      this.observer = null;
+      const captionContainer = document.querySelector(
+        ".ytp-caption-window-container"
+      );
+      if (captionContainer === null) {
+        return;
+      }
+      this.observer = new MutationObserver(() => this.scheduleCaptionRead());
+      this.observer.observe(captionContainer, {
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
+    }
+    /** 短延迟防抖可合并实时字幕的逐字符更新，避免每个字符都重启一次 TTS。 */
+    scheduleCaptionRead() {
+      if (!this.enabled) {
+        return;
+      }
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+      }
+      this.captionReadTimer = window.setTimeout(() => {
+        this.captionReadTimer = null;
+        this.readCurrentCaption();
+      }, 120);
+    }
+    readCurrentCaption() {
+      if (!this.enabled) {
+        return;
+      }
+      const video = document.querySelector("video.html5-main-video");
+      if (video?.paused === true || video?.ended === true) {
+        return;
+      }
+      const caption = Array.from(
+        document.querySelectorAll(CAPTION_SEGMENT_SELECTOR)
+      ).map((segment) => normalizeCaption(segment.textContent ?? "")).filter(Boolean).join(" ").trim();
+      if (!caption || caption === this.previousCaption) {
+        return;
+      }
+      const newText = removeRepeatedPrefix(this.previousCaption, caption);
+      this.previousCaption = caption;
+      if (newText) {
+        this.pendingCaption = appendCaption(this.pendingCaption, newText);
+        this.flushCaptionQueue();
+      }
+    }
+    /** 同一时刻只提交一个字幕话语；后续 DOM 更新先进入缓冲，等待 completed。 */
+    flushCaptionQueue() {
+      if (!this.enabled || this.captionSpeechActive || !this.pendingCaption) {
+        return;
+      }
+      const text = this.pendingCaption;
+      this.pendingCaption = "";
+      this.captionSpeechActive = true;
+      this.context.playCaption(text);
+    }
+    handlePlaybackState(state) {
+      if (state.source !== "caption") {
+        return;
+      }
+      if (state.status === "loading" || state.status === "playing" || state.status === "paused") {
+        this.captionSpeechActive = true;
+        return;
+      }
+      if (state.status === "completed") {
+        this.captionSpeechActive = false;
+        this.flushCaptionQueue();
+        return;
+      }
+      if (state.status === "stopped" || state.status === "error") {
+        this.enabled = false;
+        this.captionSpeechActive = false;
+        this.pendingCaption = "";
+      }
+    }
+    report(code, message) {
+      const error = {
+        code,
+        message,
+        source: "content",
+        recoverable: true
+      };
+      this.context.reportError(error);
+    }
+  };
+  function isYoutubeHost(hostname) {
+    return hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+  }
+  function isWatchPage(url) {
+    return isYoutubeHost(url.hostname) && url.pathname === "/watch";
+  }
+  function normalizeCaption(text) {
+    return text.replace(/\s+/gu, " ").trim();
+  }
+  function appendCaption(buffer, text) {
+    return buffer ? `${buffer} ${text}` : text;
+  }
+  function normalizeMenuLabel(text) {
+    return text.normalize("NFKC").toLowerCase().replace(/[\s\-_/]+/gu, "").trim();
+  }
+  function getMenuItemLabel(item) {
+    const label = item.querySelector(".ytp-menuitem-label");
+    return normalizeMenuLabel(label?.textContent ?? item.textContent ?? "");
+  }
+  function isSubtitleMenuLabel(label) {
+    return label.includes("\u5B57\u5E55") || label.includes("subtitles") || label.includes("captions");
+  }
+  function isAutoTranslateLabel(label) {
+    return label.includes("\u81EA\u52A8\u7FFB\u8BD1") || label.includes("autotranslate");
+  }
+  function isSimplifiedChineseLabel(label) {
+    const targets = /* @__PURE__ */ new Set([
+      "\u4E2D\u6587(\u7B80\u4F53)",
+      "\u7B80\u4F53\u4E2D\u6587",
+      "chinese(simplified)",
+      "chinese(simplifiedchinese)"
+    ]);
+    return targets.has(label);
+  }
+  function getVisibleMenuItems() {
+    const player = document.querySelector(".html5-video-player");
+    if (player === null) {
+      return [];
+    }
+    const candidates = Array.from(
+      player.querySelectorAll(
+        ".ytp-menuitem, [role='menuitem'], .ytp-menuitem-label"
+      )
+    );
+    const clickableItems = candidates.map(
+      (candidate) => candidate.closest(".ytp-menuitem, [role='menuitem']") ?? candidate
+    );
+    return Array.from(new Set(clickableItems)).filter((item) => {
+      const style = window.getComputedStyle(item);
+      const rect = item.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    });
+  }
+  async function waitForMenuItem(matches, errorMessage, scrollToEnd = false) {
+    const item = await waitForValue(
+      () => {
+        const matched = getVisibleMenuItems().find(
+          (candidate) => matches(getMenuItemLabel(candidate))
+        ) ?? null;
+        if (matched === null && scrollToEnd) {
+          scrollOpenMenuToEnd();
+        }
+        return matched;
+      },
+      3e3
+    );
+    if (item === null) {
+      throw new Error(errorMessage);
+    }
+    return item;
+  }
+  function scrollOpenMenuToEnd() {
+    const player = document.querySelector(".html5-video-player");
+    const panels = player === null ? [] : Array.from(
+      player.querySelectorAll(
+        ".ytp-panel-menu, [role='menu']"
+      )
+    );
+    for (const panel of panels) {
+      if (panel.scrollHeight > panel.clientHeight) {
+        panel.scrollTop = panel.scrollHeight;
+      }
+    }
+  }
+  async function waitForCondition(condition, errorMessage) {
+    const matched = await waitForValue(() => condition() ? true : null, 2e3);
+    if (matched === null) {
+      throw new Error(errorMessage);
+    }
+  }
+  async function waitForValue(read, timeout) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const value = read();
+      if (value !== null) {
+        return value;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
+    return read();
+  }
+  function removeRepeatedPrefix(previous, current) {
+    if (!previous) {
+      return current;
+    }
+    const maximumOverlap = Math.min(previous.length, current.length);
+    for (let length = maximumOverlap; length > 0; length -= 1) {
+      if (previous.slice(-length) === current.slice(0, length)) {
+        return current.slice(length).trim();
+      }
+    }
+    return current;
+  }
+
+  // src/content/site-tool-panel.ts
+  var SITE_INTEGRATIONS = [
+    endGfwSiteIntegration,
+    youtubeSiteIntegration
+  ];
+  function resolveSiteIntegration(url, context) {
+    const integration = SITE_INTEGRATIONS.find(
+      (candidate) => candidate.matches(url)
+    );
+    return integration?.create(url, context) ?? null;
+  }
+
   // src/content/content-script.ts
   function isSupportedPage(url) {
     return url.protocol === "http:" || url.protocol === "https:";
@@ -1752,6 +2534,7 @@
     initializePagePlayback(resolvePageAdapter(new URL(window.location.href)));
   }
   function initializePagePlayback(defaultAdapter) {
+    let pageSessionId = crypto.randomUUID();
     const errorFeedback = new ErrorFeedback();
     const visibleTextAdapter = new VisibleTextAdapter();
     let activeAdapter = defaultAdapter;
@@ -1760,7 +2543,17 @@
       priority: 0,
       matches: (url) => activeAdapter.matches(url),
       scanTextItems: () => activeAdapter.scanTextItems(),
+      getQueueContextId: () => activeAdapter.getQueueContextId?.() ?? activeAdapter.id,
       findTextElement: (itemId) => activeAdapter.findTextElement(itemId),
+      getHighlightTextColor: (itemId) => activeAdapter.getHighlightTextColor?.(itemId) ?? null,
+      getTextElementCharOffset: (itemId) => activeAdapter.getTextElementCharOffset?.(itemId) ?? 0,
+      resolveTextDomPosition: (itemId, charIndex) => {
+        if (activeAdapter.resolveTextDomPosition) {
+          return activeAdapter.resolveTextDomPosition(itemId, charIndex);
+        }
+        const element = activeAdapter.findTextElement(itemId);
+        return element ? { element, charIndex } : null;
+      },
       findSelectionPosition: (selection) => activeAdapter.findSelectionPosition(selection)
     };
     const highlighter = new PageHighlighter(adapterProxy);
@@ -1777,6 +2570,8 @@
     let lastAutoSelectionText = "";
     let selectionTimer = null;
     let scanTimer = null;
+    let hasRegisteredPageSession = false;
+    let activeQueueContextId = null;
     let settings = { ...DEFAULT_SETTINGS };
     let latestState = {
       status: "idle",
@@ -1786,6 +2581,21 @@
     };
     let keepAlivePort = null;
     let keepAliveTimer = null;
+    const sitePlaybackStateListeners = /* @__PURE__ */ new Set();
+    const siteIntegration = resolveSiteIntegration(new URL(window.location.href), {
+      getCurrentTextElement: () => currentItemId === null ? null : activeAdapter.findTextElement(currentItemId),
+      reportError: (error) => showError(error),
+      playCaption: (text) => {
+        void executePlayerRequest({ type: "site:play-caption", text });
+      },
+      stopPlayback: () => {
+        void executePlayerRequest({ type: "player:stop" });
+      },
+      subscribePlaybackState: (listener) => {
+        sitePlaybackStateListeners.add(listener);
+        return () => sitePlaybackStateListeners.delete(listener);
+      }
+    });
     const controlBar = new FloatingControlBar({
       onTogglePlayback() {
         void executePageCommand({ type: "page:toggle" });
@@ -1819,13 +2629,11 @@
           text,
           source: "input"
         });
-      },
-      onRateChange(rate) {
-        void saveSettings({ rate });
-      },
-      onVolumeChange(volume) {
-        void saveSettings({ volume });
       }
+    }, siteIntegration?.toolPanel ?? null, siteIntegration?.startExpanded ?? false);
+    siteIntegration?.start?.();
+    window.addEventListener("pagehide", () => siteIntegration?.stop?.(), {
+      once: true
     });
     async function executePlayerRequest(request) {
       try {
@@ -1836,7 +2644,7 @@
     }
     async function executePageCommand(request) {
       try {
-        await sendRequest({ type: "page:set-items", items });
+        await sendRequest({ type: "page:set-items", items, pageSessionId });
         renderPlaybackState(await sendRequest(request));
       } catch (error) {
         showError(createContentError("PAGE_COMMAND_FAILED", error));
@@ -1844,6 +2652,9 @@
     }
     function renderPlaybackState(state) {
       latestState = state;
+      for (const listener of sitePlaybackStateListeners) {
+        listener(state);
+      }
       updatePlayerKeepAlive(state);
       controlBar.renderState(state);
       if (!settings.globalEnabled) {
@@ -1880,7 +2691,6 @@
       }
     }
     async function applyRuntimeSettings(nextSettings) {
-      controlBar.renderSettings(nextSettings);
       highlighter.renderColors(
         nextSettings.highlightBorderColor,
         nextSettings.highlightBackgroundColor
@@ -1947,13 +2757,32 @@
       if (scanningAdapter !== activeAdapter) {
         return;
       }
+      const nextQueueContextId = scanningAdapter.getQueueContextId?.() ?? scanningAdapter.id;
+      const queueContextChanged = activeQueueContextId !== null && activeQueueContextId !== nextQueueContextId;
+      activeQueueContextId = nextQueueContextId;
+      if (queueContextChanged) {
+        pageSessionId = crypto.randomUUID();
+        if (latestState.source === "page" && (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused")) {
+          renderPlaybackState(await sendRequest({ type: "player:stop" }));
+        }
+        highlighter.clear();
+        items = [];
+        currentItemId = null;
+        hasRegisteredPageSession = false;
+        renderNavigation();
+      }
       const previousSignature = items.map((item) => `${item.id}:${item.text}`).join("|");
       const nextSignature = nextItems.map((item) => `${item.id}:${item.text}`).join("|");
       items = nextItems;
       highlighter.refresh();
       renderNavigation();
-      if (previousSignature !== nextSignature) {
-        await executePlayerRequest({ type: "page:set-items", items });
+      if (!hasRegisteredPageSession || previousSignature !== nextSignature) {
+        await executePlayerRequest({
+          type: "page:set-items",
+          items,
+          pageSessionId
+        });
+        hasRegisteredPageSession = true;
       }
     }
     async function applyTextScanMode(nextSettings) {
@@ -1967,18 +2796,11 @@
       highlighter.clear();
       selectionJumpPrompt.hide();
       activeAdapter = nextAdapter;
+      activeQueueContextId = null;
       items = [];
       currentItemId = null;
       renderNavigation();
       await scanPage();
-    }
-    async function saveSettings(changes) {
-      try {
-        settings = await updateSettings(changes);
-        controlBar.renderSettings(settings);
-      } catch (error) {
-        showError(createContentError("SAVE_SETTINGS_FAILED", error));
-      }
     }
     function scheduleSelectionAutoPlay(event) {
       if (!settings.globalEnabled) {
@@ -2092,10 +2914,9 @@
     }).catch((error) => {
       showError(createContentError("LOAD_SETTINGS_FAILED", error));
     });
-    void scanPage().catch((error) => {
+    void scanPage().then(() => executePlayerRequest({ type: "player:get-state" })).catch((error) => {
       showError(createContentError("PAGE_SCAN_FAILED", error));
     });
-    void executePlayerRequest({ type: "player:get-state" });
   }
   function getSelectedText() {
     return window.getSelection()?.toString().replace(/\s+/g, " ").trim() ?? "";

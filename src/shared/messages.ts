@@ -7,12 +7,13 @@ import type {
 
 /** 设置页和 content script 可以发送给 service worker 的播放器命令。 */
 export type ExtensionRequest =
-  | { type: "page:set-items"; items: PageTextItem[] }
+  | { type: "page:set-items"; items: PageTextItem[]; pageSessionId: string }
   | { type: "page:toggle" }
   | { type: "page:previous" }
   | { type: "page:next" }
   | { type: "page:play-from-position"; itemId: string; charIndex: number }
   | { type: "player:play-text"; text: string; source: "selection" | "input" }
+  | { type: "site:play-caption"; text: string }
   | { type: "selection:auto-play"; text: string }
   | { type: "player:stop" }
   | { type: "player:get-state" }
@@ -40,7 +41,14 @@ export function isExtensionRequest(value: unknown): value is ExtensionRequest {
 
   const type = value.type;
   if (type === "page:set-items") {
-    return "items" in value && isPageTextItemArray(value.items);
+    return (
+      "items" in value &&
+      isPageTextItemArray(value.items) &&
+      "pageSessionId" in value &&
+      typeof value.pageSessionId === "string" &&
+      value.pageSessionId.length >= 16 &&
+      value.pageSessionId.length <= 128
+    );
   }
 
   if (type === "player:play-text") {
@@ -54,6 +62,14 @@ export function isExtensionRequest(value: unknown): value is ExtensionRequest {
   }
 
   if (type === "selection:auto-play") {
+    return (
+      "text" in value &&
+      typeof value.text === "string" &&
+      isSpeakableText(value.text)
+    );
+  }
+
+  if (type === "site:play-caption") {
     return (
       "text" in value &&
       typeof value.text === "string" &&

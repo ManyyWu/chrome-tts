@@ -16,12 +16,12 @@ import {
   DEFAULT_SETTINGS,
   loadSettings,
   SETTINGS_KEY,
-  updateSettings,
 } from "../shared/settings";
 import { ErrorFeedback } from "./error-feedback";
 import { FloatingControlBar } from "./floating-control-bar";
 import { PageHighlighter } from "./page-highlighter";
 import { SelectionJumpPrompt } from "./selection-jump-prompt";
+import { resolveSiteIntegration } from "./site-tool-panel";
 
 /** 通用模式支持所有普通 HTTP/HTTPS 页面；浏览器内部页面不允许注入 content script。 */
 function isSupportedPage(url: URL): boolean {
@@ -56,6 +56,8 @@ if (isSupportedPage(new URL(window.location.href))) {
 
 /** 初始化通用页面队列、QuickPanel、高亮、动态扫描和自动选择播放。 */
 function initializePagePlayback(defaultAdapter: PageAdapter): void {
+  // 每次文档加载生成新标识，弥补 Edge Android 可能漏发 tabs.onUpdated 的情况。
+  let pageSessionId = crypto.randomUUID();
   const errorFeedback = new ErrorFeedback();
   const visibleTextAdapter = new VisibleTextAdapter();
   let activeAdapter: PageAdapter = defaultAdapter;
@@ -65,7 +67,20 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     priority: 0,
     matches: (url) => activeAdapter.matches(url),
     scanTextItems: () => activeAdapter.scanTextItems(),
+    getQueueContextId: () =>
+      activeAdapter.getQueueContextId?.() ?? activeAdapter.id,
     findTextElement: (itemId) => activeAdapter.findTextElement(itemId),
+    getHighlightTextColor: (itemId) =>
+      activeAdapter.getHighlightTextColor?.(itemId) ?? null,
+    getTextElementCharOffset: (itemId) =>
+      activeAdapter.getTextElementCharOffset?.(itemId) ?? 0,
+    resolveTextDomPosition: (itemId, charIndex) => {
+      if (activeAdapter.resolveTextDomPosition) {
+        return activeAdapter.resolveTextDomPosition(itemId, charIndex);
+      }
+      const element = activeAdapter.findTextElement(itemId);
+      return element ? { element, charIndex } : null;
+    },
     findSelectionPosition: (selection) =>
       activeAdapter.findSelectionPosition(selection),
   };
@@ -83,6 +98,8 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
   let lastAutoSelectionText = "";
   let selectionTimer: number | null = null;
   let scanTimer: number | null = null;
+  let hasRegisteredPageSession = false;
+  let activeQueueContextId: string | null = null;
   let settings: ExtensionSettings = { ...DEFAULT_SETTINGS };
   let latestState: PlaybackState = {
     status: "idle",
@@ -92,6 +109,27 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
   };
   let keepAlivePort: chrome.runtime.Port | null = null;
   let keepAliveTimer: number | null = null;
+  const sitePlaybackStateListeners = new Set<
+    (state: PlaybackState) => void
+  >();
+
+  const siteIntegration = resolveSiteIntegration(new URL(window.location.href), {
+    getCurrentTextElement: () =>
+      currentItemId === null
+        ? null
+        : activeAdapter.findTextElement(currentItemId),
+    reportError: (error) => showError(error),
+    playCaption: (text) => {
+      void executePlayerRequest({ type: "site:play-caption", text });
+    },
+    stopPlayback: () => {
+      void executePlayerRequest({ type: "player:stop" });
+    },
+    subscribePlaybackState: (listener) => {
+      sitePlaybackStateListeners.add(listener);
+      return () => sitePlaybackStateListeners.delete(listener);
+    },
+  });
 
   const controlBar = new FloatingControlBar({
     onTogglePlayback() {
@@ -127,12 +165,12 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
         source: "input",
       });
     },
-    onRateChange(rate) {
-      void saveSettings({ rate });
-    },
-    onVolumeChange(volume) {
-      void saveSettings({ volume });
-    },
+  }, siteIntegration?.toolPanel ?? null, siteIntegration?.startExpanded ?? false);
+  siteIntegration?.start?.();
+
+  // 为未来的单页应用监听器或媒体会话适配预留统一销毁入口。
+  window.addEventListener("pagehide", () => siteIntegration?.stop?.(), {
+    once: true,
   });
 
   /** 统一渲染同步响应；异步 TTS 事件随后由 onMessage 继续更新。 */
@@ -160,7 +198,7 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
         },
   ): Promise<void> {
     try {
-      await sendRequest({ type: "page:set-items", items });
+      await sendRequest({ type: "page:set-items", items, pageSessionId });
       renderPlaybackState(await sendRequest(request));
     } catch (error: unknown) {
       showError(createContentError("PAGE_COMMAND_FAILED", error));
@@ -169,6 +207,9 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
 
   function renderPlaybackState(state: PlaybackState): void {
     latestState = state;
+    for (const listener of sitePlaybackStateListeners) {
+      listener(state);
+    }
     updatePlayerKeepAlive(state);
     controlBar.renderState(state);
     if (!settings.globalEnabled) {
@@ -223,7 +264,6 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
   async function applyRuntimeSettings(
     nextSettings: ExtensionSettings,
   ): Promise<void> {
-    controlBar.renderSettings(nextSettings);
     highlighter.renderColors(
       nextSettings.highlightBorderColor,
       nextSettings.highlightBackgroundColor,
@@ -312,6 +352,30 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     if (scanningAdapter !== activeAdapter) {
       return;
     }
+    const nextQueueContextId =
+      scanningAdapter.getQueueContextId?.() ?? scanningAdapter.id;
+    const queueContextChanged =
+      activeQueueContextId !== null &&
+      activeQueueContextId !== nextQueueContextId;
+    activeQueueContextId = nextQueueContextId;
+    if (queueContextChanged) {
+      // X 等单页应用切换互斥时间线时，旧话语和位置不得进入新标签队列。
+      // 同时轮换页面会话 ID，使 service worker 清除旧队列游标并从新队列第 0 条开始。
+      pageSessionId = crypto.randomUUID();
+      if (
+        latestState.source === "page" &&
+        (latestState.status === "loading" ||
+          latestState.status === "playing" ||
+          latestState.status === "paused")
+      ) {
+        renderPlaybackState(await sendRequest({ type: "player:stop" }));
+      }
+      highlighter.clear();
+      items = [];
+      currentItemId = null;
+      hasRegisteredPageSession = false;
+      renderNavigation();
+    }
     const previousSignature = items
       .map((item) => `${item.id}:${item.text}`)
       .join("|");
@@ -322,8 +386,13 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     highlighter.refresh();
     renderNavigation();
 
-    if (previousSignature !== nextSignature) {
-      await executePlayerRequest({ type: "page:set-items", items });
+    if (!hasRegisteredPageSession || previousSignature !== nextSignature) {
+      await executePlayerRequest({
+        type: "page:set-items",
+        items,
+        pageSessionId,
+      });
+      hasRegisteredPageSession = true;
     }
   }
 
@@ -346,21 +415,11 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     highlighter.clear();
     selectionJumpPrompt.hide();
     activeAdapter = nextAdapter;
+    activeQueueContextId = null;
     items = [];
     currentItemId = null;
     renderNavigation();
     await scanPage();
-  }
-
-  async function saveSettings(
-    changes: Partial<Pick<ExtensionSettings, "rate" | "volume">>,
-  ): Promise<void> {
-    try {
-      settings = await updateSettings(changes);
-      controlBar.renderSettings(settings);
-    } catch (error: unknown) {
-      showError(createContentError("SAVE_SETTINGS_FAILED", error));
-    }
   }
 
   function scheduleSelectionAutoPlay(event: Event): void {
@@ -503,10 +562,12 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     .catch((error: unknown) => {
       showError(createContentError("LOAD_SETTINGS_FAILED", error));
     });
-  void scanPage().catch((error: unknown) => {
-    showError(createContentError("PAGE_SCAN_FAILED", error));
-  });
-  void executePlayerRequest({ type: "player:get-state" });
+  // 必须先登记当前文档的页面会话，再读取播放器状态；否则移动端可能先渲染旧文档状态。
+  void scanPage()
+    .then(() => executePlayerRequest({ type: "player:get-state" }))
+    .catch((error: unknown) => {
+      showError(createContentError("PAGE_SCAN_FAILED", error));
+    });
 }
 
 function getSelectedText(): string {

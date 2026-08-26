@@ -9,7 +9,7 @@ export type PlaybackStatus =
   | "error";
 
 /** 当前话语的来源决定播放完成后是否继续页面队列。 */
-export type PlaybackSource = "page" | "selection" | "input" | null;
+export type PlaybackSource = "page" | "selection" | "input" | "caption" | null;
 
 /**
  * service worker 对外发布的播放器快照。

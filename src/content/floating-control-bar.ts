@@ -1,4 +1,5 @@
-import type { ExtensionSettings, PlaybackState } from "../shared/models";
+import type { PlaybackState } from "../shared/models";
+import type { SiteToolPanelConfig } from "./site-tool-panel";
 
 type ControlIcon =
   | "previous"
@@ -8,9 +9,8 @@ type ControlIcon =
   | "loading"
   | "selection"
   | "text"
-  | "speed"
-  | "volume"
   | "settings"
+  | "site-tools"
   | "drag"
   | "collapse";
 
@@ -21,8 +21,6 @@ export interface FloatingControlBarActions {
   onNext(): void;
   onPlaySelection(): void;
   onPlayText(text: string): void;
-  onRateChange(rate: number): void;
-  onVolumeChange(volume: number): void;
 }
 
 /**
@@ -41,13 +39,12 @@ export class FloatingControlBar {
   private readonly inputPanel: HTMLDivElement;
   private readonly textInput: HTMLTextAreaElement;
   private readonly inputMessage: HTMLDivElement;
-  private readonly ratePanel: HTMLDivElement;
-  private readonly rateValue: HTMLOutputElement;
-  private readonly volumePanel: HTMLDivElement;
-  private readonly volumeInput: HTMLInputElement;
-  private readonly volumeValue: HTMLOutputElement;
+  private readonly siteToolPanel: HTMLDivElement;
   private readonly settingsOverlayHost: HTMLDivElement;
-  private currentRate = 1;
+  private readonly siteToolActionVisibility: Array<{
+    button: HTMLButtonElement;
+    isAvailable: () => boolean;
+  }> = [];
   private hasPageItems = false;
   private isLoading = false;
   private isCollapsed = false;
@@ -55,7 +52,12 @@ export class FloatingControlBar {
   private horizontalPositionRatio: number | null = null;
   private verticalPositionRatio: number | null = null;
 
-  public constructor(actions: FloatingControlBarActions) {
+  public constructor(
+    actions: FloatingControlBarActions,
+    siteTools: SiteToolPanelConfig | null = null,
+    startExpanded = false,
+  ) {
+    this.isCollapsed = !startExpanded;
     this.host = document.createElement("div");
     this.host.id = "chrome-tts-floating-control-bar";
 
@@ -74,8 +76,6 @@ export class FloatingControlBar {
     this.nextButton = this.createButton("next", "播放下一条");
     const selectionButton = this.createButton("selection", "播放选中文本");
     const textButton = this.createButton("text", "输入文本并播放");
-    const rateButton = this.createButton("speed", "调整播放速度");
-    const volumeButton = this.createButton("volume", "调整音量");
     const settingsButton = this.createButton("settings", "打开设置");
     const collapseButton = this.createButton("collapse", "收起快捷控制栏");
     const dragButton = this.createButton("drag", "拖动快捷控制栏");
@@ -86,11 +86,15 @@ export class FloatingControlBar {
     this.nextButton.addEventListener("click", actions.onNext);
     selectionButton.addEventListener("click", actions.onPlaySelection);
     textButton.addEventListener("click", () => this.toggleInputPanel());
-    rateButton.addEventListener("click", () => this.toggleRatePanel());
-    volumeButton.addEventListener("click", () => this.toggleVolumePanel());
     settingsButton.addEventListener("click", () => this.openSettingsPanel());
     collapseButton.addEventListener("click", () => this.collapse());
     this.initializeDragging(dragButton);
+
+    if (siteTools !== null) {
+      const siteToolsButton = this.createButton("site-tools", siteTools.title);
+      siteToolsButton.addEventListener("click", () => this.toggleSiteToolPanel());
+      this.controlBarElement.append(siteToolsButton);
+    }
 
     this.controlBarElement.append(
       this.previousButton,
@@ -98,8 +102,6 @@ export class FloatingControlBar {
       this.nextButton,
       selectionButton,
       textButton,
-      rateButton,
-      volumeButton,
       settingsButton,
       collapseButton,
       dragButton,
@@ -151,77 +153,43 @@ export class FloatingControlBar {
 
     this.inputPanel.append(this.textInput, actionRow, this.inputMessage);
 
-    this.ratePanel = document.createElement("div");
-    this.ratePanel.className = "setting-panel rate-panel";
-    this.ratePanel.hidden = true;
-
-    const rateAdjustmentRow = document.createElement("div");
-    rateAdjustmentRow.className = "adjustment-row";
-    const decreaseRateButton = this.createAdjustmentButton("−", "语速降低 0.1");
-    const increaseRateButton = this.createAdjustmentButton("+", "语速提高 0.1");
-    this.rateValue = document.createElement("output");
-    this.rateValue.className = "setting-value";
-    this.rateValue.textContent = "1×";
-    decreaseRateButton.addEventListener("click", () => {
-      this.changeRate(this.currentRate - 0.1, actions);
-    });
-    increaseRateButton.addEventListener("click", () => {
-      this.changeRate(this.currentRate + 0.1, actions);
-    });
-    rateAdjustmentRow.append(
-      decreaseRateButton,
-      this.rateValue,
-      increaseRateButton,
-    );
-
-    const presetRow = document.createElement("div");
-    presetRow.className = "preset-row";
-    for (const preset of [0.5, 1, 1.5]) {
-      const presetButton = document.createElement("button");
-      presetButton.type = "button";
-      presetButton.className = "preset-button";
-      presetButton.textContent = `${preset}×`;
-      presetButton.addEventListener("click", () => {
-        this.changeRate(preset, actions);
-      });
-      presetRow.append(presetButton);
+    this.siteToolPanel = document.createElement("div");
+    this.siteToolPanel.className = "site-tool-panel";
+    this.siteToolPanel.hidden = true;
+    if (siteTools !== null) {
+      this.siteToolPanel.setAttribute("aria-label", siteTools.title);
+      for (const action of siteTools.actions) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "site-tool-action";
+        button.textContent = action.label;
+        button.title = action.description;
+        if (action.isAvailable) {
+          this.siteToolActionVisibility.push({
+            button,
+            isAvailable: action.isAvailable,
+          });
+          button.hidden = !action.isAvailable();
+        }
+        button.addEventListener("click", () => {
+          this.siteToolPanel.hidden = true;
+          action.activate();
+        });
+        this.siteToolPanel.append(button);
+      }
     }
-    this.ratePanel.append(rateAdjustmentRow, presetRow);
-
-    this.volumePanel = document.createElement("div");
-    this.volumePanel.className = "setting-panel volume-panel";
-    this.volumePanel.hidden = true;
-    this.volumeInput = document.createElement("input");
-    this.volumeInput.type = "range";
-    this.volumeInput.min = "0";
-    this.volumeInput.max = "1";
-    this.volumeInput.step = "0.05";
-    this.volumeInput.value = "1";
-    this.volumeInput.setAttribute("aria-label", "播放音量");
-    this.volumeValue = document.createElement("output");
-    this.volumeValue.className = "volume-value";
-    this.volumeValue.textContent = "100%";
-    this.volumeInput.addEventListener("input", () => {
-      const volume = Number(this.volumeInput.value);
-      this.volumeValue.textContent = `${Math.round(volume * 100)}%`;
-    });
-    this.volumeInput.addEventListener("change", () => {
-      const volume = Number(this.volumeInput.value);
-      actions.onVolumeChange(volume);
-    });
-    this.volumePanel.append(this.volumeInput, this.volumeValue);
 
     this.settingsOverlayHost = this.createSettingsOverlay();
 
     shadowRoot.append(
       this.controlBarElement,
       this.inputPanel,
-      this.ratePanel,
-      this.volumePanel,
+      this.siteToolPanel,
     );
     document.documentElement.append(this.host);
     document.documentElement.append(this.launcherHost);
     document.documentElement.append(this.settingsOverlayHost);
+    this.renderVisibility();
 
     // 拖动后使用固定 left/top；视口缩小时重新约束，避免控制栏留在不可见区域。
     const handleViewportResize = (): void => {
@@ -276,14 +244,6 @@ export class FloatingControlBar {
     this.playButton.disabled = !this.hasPageItems || this.isLoading;
   }
 
-  /** 将 storage 中的倍速和音量同步到控制栏，不触发保存回调。 */
-  public renderSettings(settings: ExtensionSettings): void {
-    this.currentRate = settings.rate;
-    this.rateValue.textContent = `${formatRate(settings.rate)}×`;
-    this.volumeInput.value = String(settings.volume);
-    this.volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
-  }
-
   /** 全局关闭时同时隐藏完整控制栏和收起后的启动图标。 */
   public setGlobalEnabled(enabled: boolean): void {
     this.isGloballyEnabled = enabled;
@@ -307,20 +267,6 @@ export class FloatingControlBar {
     button.type = "button";
     button.className = "control-button";
     button.append(this.createIcon(icon));
-    button.title = description;
-    button.setAttribute("aria-label", description);
-    return button;
-  }
-
-  /** 创建倍速微调按钮；弹层控件使用文字可直接表达增减方向。 */
-  private createAdjustmentButton(
-    label: string,
-    description: string,
-  ): HTMLButtonElement {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "adjustment-button";
-    button.textContent = label;
     button.title = description;
     button.setAttribute("aria-label", description);
     return button;
@@ -437,8 +383,7 @@ export class FloatingControlBar {
 
   /** 展开或关闭文本输入层，并在展开后把键盘焦点移到文本框。 */
   private toggleInputPanel(): void {
-    this.ratePanel.hidden = true;
-    this.volumePanel.hidden = true;
+    this.siteToolPanel.hidden = true;
     this.inputPanel.hidden = !this.inputPanel.hidden;
     this.showInputMessage("");
     if (!this.inputPanel.hidden) {
@@ -493,33 +438,26 @@ export class FloatingControlBar {
       `translate(${translateX}px, ${translateY}px)`;
   }
 
-  /** 切换倍速弹层并关闭其他互斥弹层。 */
-  private toggleRatePanel(): void {
+  /** 切换当前网站提供的工具面板，并关闭其他互斥弹层。 */
+  private toggleSiteToolPanel(): void {
     this.inputPanel.hidden = true;
-    this.volumePanel.hidden = true;
-    this.ratePanel.hidden = !this.ratePanel.hidden;
+    for (const action of this.siteToolActionVisibility) {
+      action.button.hidden = !action.isAvailable();
+    }
+    this.siteToolPanel.hidden = !this.siteToolPanel.hidden;
   }
 
-  /** 切换音量弹层并关闭其他互斥弹层。 */
-  private toggleVolumePanel(): void {
-    this.inputPanel.hidden = true;
-    this.ratePanel.hidden = true;
-    this.volumePanel.hidden = !this.volumePanel.hidden;
-  }
-
-  /** 关闭文本输入、倍速和音量三个互斥弹层。 */
+  /** 关闭浮动条内所有弹层以及独立设置遮罩。 */
   private closeAllPanels(): void {
     this.inputPanel.hidden = true;
-    this.ratePanel.hidden = true;
-    this.volumePanel.hidden = true;
+    this.siteToolPanel.hidden = true;
     this.settingsOverlayHost.hidden = true;
   }
 
   /** 在网页上方打开通用设置页，绕过 Edge Android 不可用的 action.openPopup。 */
   private openSettingsPanel(): void {
     this.inputPanel.hidden = true;
-    this.ratePanel.hidden = true;
-    this.volumePanel.hidden = true;
+    this.siteToolPanel.hidden = true;
     this.settingsOverlayHost.hidden = false;
   }
 
@@ -625,18 +563,6 @@ export class FloatingControlBar {
     return overlayHost;
   }
 
-  /** 将微调结果限制在 0.5–1.5，并消除小数累加产生的浮点误差。 */
-  private changeRate(
-    requestedRate: number,
-    actions: FloatingControlBarActions,
-  ): void {
-    const rate =
-      Math.round(Math.min(1.5, Math.max(0.5, requestedRate)) * 10) / 10;
-    this.currentRate = rate;
-    this.rateValue.textContent = `${formatRate(rate)}×`;
-    actions.onRateChange(rate);
-  }
-
   /**
    * 在用户点击后读取系统剪贴板并覆盖文本框内容。
    * clipboardRead 权限只用于这次显式操作；读取失败时保留原文本并显示原因。
@@ -722,15 +648,6 @@ export class FloatingControlBar {
         appendShape("rect", { x: "5", y: "3", width: "14", height: "18", rx: "2" });
         appendShape("path", { d: "M8 8h8M8 12h8M8 16h5" });
         break;
-      case "speed":
-        appendShape("path", { d: "M4.93 19.07a10 10 0 1 1 14.14 0" });
-        appendShape("path", { d: "m12 12 4-4" });
-        appendShape("circle", { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" });
-        break;
-      case "volume":
-        appendShape("path", { d: "M5 10v4h3l4 4V6L8 10z", fill: "currentColor", stroke: "none" });
-        appendShape("path", { d: "M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" });
-        break;
       case "settings":
         // 使用完整齿轮轮廓，避免中心圆加放射线在视觉上被识别为亮度按钮。
         appendShape("path", {
@@ -738,6 +655,12 @@ export class FloatingControlBar {
           fill: "currentColor",
           stroke: "none",
         });
+        break;
+      case "site-tools":
+        appendShape("rect", { x: "4", y: "4", width: "6", height: "6", rx: "1" });
+        appendShape("rect", { x: "14", y: "4", width: "6", height: "6", rx: "1" });
+        appendShape("rect", { x: "4", y: "14", width: "6", height: "6", rx: "1" });
+        appendShape("path", { d: "M14 17h6M17 14v6" });
         break;
       case "drag":
         for (const x of [9, 15]) {
@@ -873,10 +796,14 @@ export class FloatingControlBar {
         display: none;
       }
 
-      .setting-panel {
+      .site-tool-panel {
         position: absolute;
+        top: 0;
         right: 54px;
+        display: grid;
+        gap: 7px;
         box-sizing: border-box;
+        width: 180px;
         padding: 10px;
         border: 1px solid rgb(0 0 0 / 12%);
         border-radius: 10px;
@@ -884,79 +811,26 @@ export class FloatingControlBar {
         box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
       }
 
-      .setting-panel[hidden] {
+      .site-tool-panel[hidden] {
         display: none;
       }
 
-      .rate-panel {
-        top: 126px;
-        width: 280px;
-      }
-
-      .volume-panel {
-        top: 170px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        width: 250px;
-      }
-
-      .adjustment-row {
-        display: grid;
-        grid-template-columns: 38px 1fr 38px;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .adjustment-button,
-      .preset-button {
+      .site-tool-action {
         box-sizing: border-box;
+        width: 100%;
+        min-height: 36px;
+        padding: 8px 10px;
         border: 0;
         border-radius: 7px;
         color: #202124;
         background: #f1f3f4;
         cursor: pointer;
-        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font: 600 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: left;
       }
 
-      .adjustment-button {
-        height: 34px;
-        font-size: 20px;
-      }
-
-      .setting-value {
-        text-align: center;
-        font-size: 15px;
-        font-weight: 600;
-      }
-
-      .preset-row {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 5px;
-        margin-top: 8px;
-      }
-
-      .preset-button {
-        padding: 8px 3px;
-      }
-
-      .adjustment-button:hover,
-      .preset-button:hover {
+      .site-tool-action:hover {
         background: #e3e7ea;
-      }
-
-      .volume-panel input[type="range"] {
-        flex: 1;
-        min-width: 0;
-        accent-color: #1a73e8;
-      }
-
-      .volume-value {
-        flex: 0 0 42px;
-        text-align: right;
-        font-size: 13px;
-        font-weight: 600;
       }
 
       textarea {
@@ -1117,9 +991,4 @@ export class FloatingControlBar {
     this.host.hidden = !this.isGloballyEnabled || this.isCollapsed;
     this.launcherHost.hidden = !this.isGloballyEnabled || !this.isCollapsed;
   }
-}
-
-/** 移除无意义的尾随零，保证 0.1 粒度以简洁形式显示。 */
-function formatRate(rate: number): string {
-  return Number(rate.toFixed(2)).toString();
 }

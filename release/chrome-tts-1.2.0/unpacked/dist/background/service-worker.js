@@ -7,7 +7,7 @@
     }
     const type = value.type;
     if (type === "page:set-items") {
-      return "items" in value && isPageTextItemArray(value.items);
+      return "items" in value && isPageTextItemArray(value.items) && "pageSessionId" in value && typeof value.pageSessionId === "string" && value.pageSessionId.length >= 16 && value.pageSessionId.length <= 128;
     }
     if (type === "player:play-text") {
       return "text" in value && typeof value.text === "string" && isSpeakableText(value.text) && "source" in value && (value.source === "selection" || value.source === "input");
@@ -372,7 +372,7 @@
     switch (request.type) {
       case "page:set-items": {
         const tabId = requireSenderTabId(sender);
-        await updatePageQueue(tabId, request.items);
+        await updatePageQueue(tabId, request.items, request.pageSessionId);
         return { ok: true, state: getStateForTab(tabId) };
       }
       case "page:toggle": {
@@ -435,27 +435,42 @@
         return { ok: true, state: player.getState() };
     }
   }
-  async function updatePageQueue(tabId, items) {
+  async function updatePageQueue(tabId, items, pageSessionId) {
     const previousQueue = pageQueues.get(tabId);
     const storedCursor = previousQueue ? null : await loadPageQueueCursor(tabId);
+    const storedPausedPlayback = previousQueue ? null : await loadPausedPlayback();
+    const previousSessionId = previousQueue?.pageSessionId ?? storedCursor?.pageSessionId ?? (storedPausedPlayback?.tabId === tabId ? storedPausedPlayback.pageSessionId : void 0);
+    const isNewPageSession = previousSessionId !== void 0 && previousSessionId !== pageSessionId;
+    if (isNewPageSession) {
+      if (activePlaybackTabId === tabId || playbackOwnerTabId === tabId) {
+        player.stop();
+        activePlaybackTabId = null;
+        playbackOwnerTabId = null;
+      }
+      await clearPausedPlaybackForTab(tabId);
+      await clearPageQueueCursor(tabId);
+    }
+    const reusableQueue = isNewPageSession ? void 0 : previousQueue;
+    const reusableCursor = isNewPageSession ? null : storedCursor;
     const nextNamespace = getItemNamespace(items[0]?.id);
-    const previousItem = previousQueue?.items[previousQueue.currentIndex];
+    const previousItem = reusableQueue?.items[reusableQueue.currentIndex];
     const previousNamespace = getItemNamespace(
-      previousItem?.id ?? storedCursor?.itemId
+      previousItem?.id ?? reusableCursor?.itemId
     );
     const sameAdapterNamespace = previousNamespace === null || previousNamespace === nextNamespace;
-    const currentItemId = sameAdapterNamespace && activePlaybackTabId === tabId && player.getState().source === "page" ? player.getState().itemId : sameAdapterNamespace ? previousItem?.id ?? storedCursor?.itemId : null;
+    const currentItemId = sameAdapterNamespace && activePlaybackTabId === tabId && player.getState().source === "page" ? player.getState().itemId : sameAdapterNamespace ? previousItem?.id ?? reusableCursor?.itemId : null;
     const matchingIndex = currentItemId ? items.findIndex((item) => item.id === currentItemId) : -1;
     const fallbackIndex = Math.min(
       Math.max(
-        sameAdapterNamespace ? previousQueue?.currentIndex ?? storedCursor?.index ?? 0 : 0,
+        sameAdapterNamespace ? reusableQueue?.currentIndex ?? reusableCursor?.index ?? 0 : 0,
         0
       ),
       Math.max(items.length - 1, 0)
     );
     pageQueues.set(tabId, {
       items: items.map((item, index) => ({ ...item, index })),
-      currentIndex: matchingIndex >= 0 ? matchingIndex : fallbackIndex
+      currentIndex: matchingIndex >= 0 ? matchingIndex : fallbackIndex,
+      pageSessionId
     });
   }
   function getItemNamespace(itemId) {
@@ -587,10 +602,11 @@
   }
   async function savePausedPlayback(tabId) {
     const speech = player.getSpeechSnapshot();
-    if (!speech) {
+    const pageSessionId = pageQueues.get(tabId)?.pageSessionId;
+    if (!speech || !pageSessionId) {
       return;
     }
-    const pausedPlayback = { tabId, ...speech };
+    const pausedPlayback = { tabId, pageSessionId, ...speech };
     await chrome.storage.session.set({ [PAUSED_PLAYBACK_KEY]: pausedPlayback });
   }
   async function loadPausedPlayback() {
@@ -600,12 +616,13 @@
       return null;
     }
     const record = value;
-    if (typeof record.tabId !== "number" || !Number.isInteger(record.tabId) || typeof record.text !== "string" || record.text.length === 0 || !isSpeechSource(record.source) || !(record.itemId === null || typeof record.itemId === "string") || typeof record.charIndex !== "number" || !Number.isFinite(record.charIndex) || typeof record.textOffset !== "number" || !Number.isFinite(record.textOffset)) {
+    if (typeof record.tabId !== "number" || !Number.isInteger(record.tabId) || typeof record.pageSessionId !== "string" || record.pageSessionId.length < 16 || record.pageSessionId.length > 128 || typeof record.text !== "string" || record.text.length === 0 || !isSpeechSource(record.source) || !(record.itemId === null || typeof record.itemId === "string") || typeof record.charIndex !== "number" || !Number.isFinite(record.charIndex) || typeof record.textOffset !== "number" || !Number.isFinite(record.textOffset)) {
       await clearPausedPlayback();
       return null;
     }
     return {
       tabId: record.tabId,
+      pageSessionId: record.pageSessionId,
       text: record.text,
       source: record.source,
       itemId: record.itemId,
@@ -629,9 +646,13 @@
     }
   }
   async function savePageQueueCursor(tabId, itemId, index) {
+    const pageSessionId = pageQueues.get(tabId)?.pageSessionId;
+    if (!pageSessionId) {
+      return;
+    }
     const stored = await chrome.storage.session.get(PAGE_QUEUE_CURSORS_KEY);
     const cursors = normalizePageQueueCursors(stored[PAGE_QUEUE_CURSORS_KEY]);
-    cursors[String(tabId)] = { itemId, index };
+    cursors[String(tabId)] = { itemId, index, pageSessionId };
     await chrome.storage.session.set({ [PAGE_QUEUE_CURSORS_KEY]: cursors });
   }
   async function loadPageQueueCursor(tabId) {
@@ -655,8 +676,12 @@
     }
     const normalized = {};
     for (const [key, cursor] of Object.entries(value)) {
-      if (typeof cursor === "object" && cursor !== null && "itemId" in cursor && typeof cursor.itemId === "string" && "index" in cursor && typeof cursor.index === "number" && Number.isInteger(cursor.index) && cursor.index >= 0) {
-        normalized[key] = { itemId: cursor.itemId, index: cursor.index };
+      if (typeof cursor === "object" && cursor !== null && "itemId" in cursor && typeof cursor.itemId === "string" && "index" in cursor && typeof cursor.index === "number" && Number.isInteger(cursor.index) && cursor.index >= 0 && "pageSessionId" in cursor && typeof cursor.pageSessionId === "string" && cursor.pageSessionId.length >= 16 && cursor.pageSessionId.length <= 128) {
+        normalized[key] = {
+          itemId: cursor.itemId,
+          index: cursor.index,
+          pageSessionId: cursor.pageSessionId
+        };
       }
     }
     return normalized;

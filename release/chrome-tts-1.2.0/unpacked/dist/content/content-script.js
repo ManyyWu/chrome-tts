@@ -345,12 +345,6 @@
     }
     return settings;
   }
-  async function updateSettings(changes) {
-    const current = await loadSettings();
-    const settings = normalizeSettings({ ...current, ...changes, version: 6 });
-    await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
-    return settings;
-  }
 
   // src/content/error-feedback.ts
   var ErrorFeedback = class {
@@ -468,20 +462,16 @@
     inputPanel;
     textInput;
     inputMessage;
-    ratePanel;
-    rateValue;
-    volumePanel;
-    volumeInput;
-    volumeValue;
+    siteToolPanel;
     settingsOverlayHost;
-    currentRate = 1;
     hasPageItems = false;
     isLoading = false;
     isCollapsed = false;
     isGloballyEnabled = true;
     horizontalPositionRatio = null;
     verticalPositionRatio = null;
-    constructor(actions) {
+    constructor(actions, siteTools = null, startExpanded = false) {
+      this.isCollapsed = !startExpanded;
       this.host = document.createElement("div");
       this.host.id = "chrome-tts-floating-control-bar";
       const shadowRoot = this.host.attachShadow({ mode: "closed" });
@@ -496,8 +486,6 @@
       this.nextButton = this.createButton("next", "\u64AD\u653E\u4E0B\u4E00\u6761");
       const selectionButton = this.createButton("selection", "\u64AD\u653E\u9009\u4E2D\u6587\u672C");
       const textButton = this.createButton("text", "\u8F93\u5165\u6587\u672C\u5E76\u64AD\u653E");
-      const rateButton = this.createButton("speed", "\u8C03\u6574\u64AD\u653E\u901F\u5EA6");
-      const volumeButton = this.createButton("volume", "\u8C03\u6574\u97F3\u91CF");
       const settingsButton = this.createButton("settings", "\u6253\u5F00\u8BBE\u7F6E");
       const collapseButton = this.createButton("collapse", "\u6536\u8D77\u5FEB\u6377\u63A7\u5236\u680F");
       const dragButton = this.createButton("drag", "\u62D6\u52A8\u5FEB\u6377\u63A7\u5236\u680F");
@@ -507,19 +495,20 @@
       this.nextButton.addEventListener("click", actions.onNext);
       selectionButton.addEventListener("click", actions.onPlaySelection);
       textButton.addEventListener("click", () => this.toggleInputPanel());
-      rateButton.addEventListener("click", () => this.toggleRatePanel());
-      volumeButton.addEventListener("click", () => this.toggleVolumePanel());
       settingsButton.addEventListener("click", () => this.openSettingsPanel());
       collapseButton.addEventListener("click", () => this.collapse());
       this.initializeDragging(dragButton);
+      if (siteTools !== null) {
+        const siteToolsButton = this.createButton("site-tools", siteTools.title);
+        siteToolsButton.addEventListener("click", () => this.toggleSiteToolPanel());
+        this.controlBarElement.append(siteToolsButton);
+      }
       this.controlBarElement.append(
         this.previousButton,
         this.playButton,
         this.nextButton,
         selectionButton,
         textButton,
-        rateButton,
-        volumeButton,
         settingsButton,
         collapseButton,
         dragButton
@@ -561,72 +550,34 @@
       this.inputMessage.className = "input-message";
       this.inputMessage.setAttribute("role", "status");
       this.inputPanel.append(this.textInput, actionRow, this.inputMessage);
-      this.ratePanel = document.createElement("div");
-      this.ratePanel.className = "setting-panel rate-panel";
-      this.ratePanel.hidden = true;
-      const rateAdjustmentRow = document.createElement("div");
-      rateAdjustmentRow.className = "adjustment-row";
-      const decreaseRateButton = this.createAdjustmentButton("\u2212", "\u8BED\u901F\u964D\u4F4E 0.1");
-      const increaseRateButton = this.createAdjustmentButton("+", "\u8BED\u901F\u63D0\u9AD8 0.1");
-      this.rateValue = document.createElement("output");
-      this.rateValue.className = "setting-value";
-      this.rateValue.textContent = "1\xD7";
-      decreaseRateButton.addEventListener("click", () => {
-        this.changeRate(this.currentRate - 0.1, actions);
-      });
-      increaseRateButton.addEventListener("click", () => {
-        this.changeRate(this.currentRate + 0.1, actions);
-      });
-      rateAdjustmentRow.append(
-        decreaseRateButton,
-        this.rateValue,
-        increaseRateButton
-      );
-      const presetRow = document.createElement("div");
-      presetRow.className = "preset-row";
-      for (const preset of [0.5, 1, 1.5]) {
-        const presetButton = document.createElement("button");
-        presetButton.type = "button";
-        presetButton.className = "preset-button";
-        presetButton.textContent = `${preset}\xD7`;
-        presetButton.addEventListener("click", () => {
-          this.changeRate(preset, actions);
-        });
-        presetRow.append(presetButton);
+      this.siteToolPanel = document.createElement("div");
+      this.siteToolPanel.className = "site-tool-panel";
+      this.siteToolPanel.hidden = true;
+      if (siteTools !== null) {
+        this.siteToolPanel.setAttribute("aria-label", siteTools.title);
+        for (const action of siteTools.actions) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "site-tool-action";
+          button.textContent = action.label;
+          button.title = action.description;
+          button.addEventListener("click", () => {
+            this.siteToolPanel.hidden = true;
+            action.activate();
+          });
+          this.siteToolPanel.append(button);
+        }
       }
-      this.ratePanel.append(rateAdjustmentRow, presetRow);
-      this.volumePanel = document.createElement("div");
-      this.volumePanel.className = "setting-panel volume-panel";
-      this.volumePanel.hidden = true;
-      this.volumeInput = document.createElement("input");
-      this.volumeInput.type = "range";
-      this.volumeInput.min = "0";
-      this.volumeInput.max = "1";
-      this.volumeInput.step = "0.05";
-      this.volumeInput.value = "1";
-      this.volumeInput.setAttribute("aria-label", "\u64AD\u653E\u97F3\u91CF");
-      this.volumeValue = document.createElement("output");
-      this.volumeValue.className = "volume-value";
-      this.volumeValue.textContent = "100%";
-      this.volumeInput.addEventListener("input", () => {
-        const volume = Number(this.volumeInput.value);
-        this.volumeValue.textContent = `${Math.round(volume * 100)}%`;
-      });
-      this.volumeInput.addEventListener("change", () => {
-        const volume = Number(this.volumeInput.value);
-        actions.onVolumeChange(volume);
-      });
-      this.volumePanel.append(this.volumeInput, this.volumeValue);
       this.settingsOverlayHost = this.createSettingsOverlay();
       shadowRoot.append(
         this.controlBarElement,
         this.inputPanel,
-        this.ratePanel,
-        this.volumePanel
+        this.siteToolPanel
       );
       document.documentElement.append(this.host);
       document.documentElement.append(this.launcherHost);
       document.documentElement.append(this.settingsOverlayHost);
+      this.renderVisibility();
       const handleViewportResize = () => {
         window.requestAnimationFrame(() => {
           this.constrainToViewport();
@@ -671,13 +622,6 @@
       this.nextButton.disabled = total === 0 || currentIndex >= total - 1;
       this.playButton.disabled = !this.hasPageItems || this.isLoading;
     }
-    /** 将 storage 中的倍速和音量同步到控制栏，不触发保存回调。 */
-    renderSettings(settings) {
-      this.currentRate = settings.rate;
-      this.rateValue.textContent = `${formatRate(settings.rate)}\xD7`;
-      this.volumeInput.value = String(settings.volume);
-      this.volumeValue.textContent = `${Math.round(settings.volume * 100)}%`;
-    }
     /** 全局关闭时同时隐藏完整控制栏和收起后的启动图标。 */
     setGlobalEnabled(enabled) {
       this.isGloballyEnabled = enabled;
@@ -696,16 +640,6 @@
       button.type = "button";
       button.className = "control-button";
       button.append(this.createIcon(icon));
-      button.title = description;
-      button.setAttribute("aria-label", description);
-      return button;
-    }
-    /** 创建倍速微调按钮；弹层控件使用文字可直接表达增减方向。 */
-    createAdjustmentButton(label, description) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "adjustment-button";
-      button.textContent = label;
       button.title = description;
       button.setAttribute("aria-label", description);
       return button;
@@ -793,8 +727,7 @@
     }
     /** 展开或关闭文本输入层，并在展开后把键盘焦点移到文本框。 */
     toggleInputPanel() {
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.inputPanel.hidden = !this.inputPanel.hidden;
       this.showInputMessage("");
       if (!this.inputPanel.hidden) {
@@ -840,30 +773,21 @@
       }
       this.inputPanel.style.transform = `translate(${translateX}px, ${translateY}px)`;
     }
-    /** 切换倍速弹层并关闭其他互斥弹层。 */
-    toggleRatePanel() {
+    /** 切换当前网站提供的工具面板，并关闭其他互斥弹层。 */
+    toggleSiteToolPanel() {
       this.inputPanel.hidden = true;
-      this.volumePanel.hidden = true;
-      this.ratePanel.hidden = !this.ratePanel.hidden;
+      this.siteToolPanel.hidden = !this.siteToolPanel.hidden;
     }
-    /** 切换音量弹层并关闭其他互斥弹层。 */
-    toggleVolumePanel() {
-      this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = !this.volumePanel.hidden;
-    }
-    /** 关闭文本输入、倍速和音量三个互斥弹层。 */
+    /** 关闭浮动条内所有弹层以及独立设置遮罩。 */
     closeAllPanels() {
       this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.settingsOverlayHost.hidden = true;
     }
     /** 在网页上方打开通用设置页，绕过 Edge Android 不可用的 action.openPopup。 */
     openSettingsPanel() {
       this.inputPanel.hidden = true;
-      this.ratePanel.hidden = true;
-      this.volumePanel.hidden = true;
+      this.siteToolPanel.hidden = true;
       this.settingsOverlayHost.hidden = false;
     }
     /**
@@ -962,13 +886,6 @@
       });
       return overlayHost;
     }
-    /** 将微调结果限制在 0.5–1.5，并消除小数累加产生的浮点误差。 */
-    changeRate(requestedRate, actions) {
-      const rate = Math.round(Math.min(1.5, Math.max(0.5, requestedRate)) * 10) / 10;
-      this.currentRate = rate;
-      this.rateValue.textContent = `${formatRate(rate)}\xD7`;
-      actions.onRateChange(rate);
-    }
     /**
      * 在用户点击后读取系统剪贴板并覆盖文本框内容。
      * clipboardRead 权限只用于这次显式操作；读取失败时保留原文本并显示原因。
@@ -1046,21 +963,18 @@
           appendShape("rect", { x: "5", y: "3", width: "14", height: "18", rx: "2" });
           appendShape("path", { d: "M8 8h8M8 12h8M8 16h5" });
           break;
-        case "speed":
-          appendShape("path", { d: "M4.93 19.07a10 10 0 1 1 14.14 0" });
-          appendShape("path", { d: "m12 12 4-4" });
-          appendShape("circle", { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" });
-          break;
-        case "volume":
-          appendShape("path", { d: "M5 10v4h3l4 4V6L8 10z", fill: "currentColor", stroke: "none" });
-          appendShape("path", { d: "M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" });
-          break;
         case "settings":
           appendShape("path", {
             d: "M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.07-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94L14.38 2.8a.49.49 0 0 0-.49-.4h-3.84a.49.49 0 0 0-.49.4L9.2 5.34c-.58.24-1.12.55-1.62.94L5.19 5.32a.49.49 0 0 0-.61.22L2.66 8.86a.49.49 0 0 0 .12.64l2.03 1.58c-.05.31-.08.64-.08.96s.03.63.08.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.23.4.32.61.22l2.39-.96c.5.39 1.04.71 1.62.94l.36 2.54c.04.24.24.4.49.4h3.84c.25 0 .45-.16.49-.4l.36-2.54c.58-.24 1.12-.55 1.62-.94l2.39.96c.23.08.49 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z",
             fill: "currentColor",
             stroke: "none"
           });
+          break;
+        case "site-tools":
+          appendShape("rect", { x: "4", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "14", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "4", y: "14", width: "6", height: "6", rx: "1" });
+          appendShape("path", { d: "M14 17h6M17 14v6" });
           break;
         case "drag":
           for (const x of [9, 15]) {
@@ -1194,10 +1108,14 @@
         display: none;
       }
 
-      .setting-panel {
+      .site-tool-panel {
         position: absolute;
+        top: 0;
         right: 54px;
+        display: grid;
+        gap: 7px;
         box-sizing: border-box;
+        width: 180px;
         padding: 10px;
         border: 1px solid rgb(0 0 0 / 12%);
         border-radius: 10px;
@@ -1205,79 +1123,26 @@
         box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
       }
 
-      .setting-panel[hidden] {
+      .site-tool-panel[hidden] {
         display: none;
       }
 
-      .rate-panel {
-        top: 126px;
-        width: 280px;
-      }
-
-      .volume-panel {
-        top: 170px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        width: 250px;
-      }
-
-      .adjustment-row {
-        display: grid;
-        grid-template-columns: 38px 1fr 38px;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .adjustment-button,
-      .preset-button {
+      .site-tool-action {
         box-sizing: border-box;
+        width: 100%;
+        min-height: 36px;
+        padding: 8px 10px;
         border: 0;
         border-radius: 7px;
         color: #202124;
         background: #f1f3f4;
         cursor: pointer;
-        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font: 600 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: left;
       }
 
-      .adjustment-button {
-        height: 34px;
-        font-size: 20px;
-      }
-
-      .setting-value {
-        text-align: center;
-        font-size: 15px;
-        font-weight: 600;
-      }
-
-      .preset-row {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 5px;
-        margin-top: 8px;
-      }
-
-      .preset-button {
-        padding: 8px 3px;
-      }
-
-      .adjustment-button:hover,
-      .preset-button:hover {
+      .site-tool-action:hover {
         background: #e3e7ea;
-      }
-
-      .volume-panel input[type="range"] {
-        flex: 1;
-        min-width: 0;
-        accent-color: #1a73e8;
-      }
-
-      .volume-value {
-        flex: 0 0 42px;
-        text-align: right;
-        font-size: 13px;
-        font-weight: 600;
       }
 
       textarea {
@@ -1434,9 +1299,6 @@
       this.launcherHost.hidden = !this.isGloballyEnabled || !this.isCollapsed;
     }
   };
-  function formatRate(rate) {
-    return Number(rate.toFixed(2)).toString();
-  }
 
   // src/content/page-highlighter.ts
   var CURRENT_CLASS = "chrome-tts-current-text";
@@ -1725,6 +1587,128 @@
     }
   };
 
+  // src/content/site-tool-panel.ts
+  var END_GFW_TWEET_SELECTOR = 'article[id][itemscope][itemtype="http://schema.org/SocialMediaPosting"]';
+  function resolveSiteToolPanel(url, context) {
+    return createEndGfwToolPanel(url, context);
+  }
+  function createEndGfwToolPanel(url, context) {
+    const date = parseEndGfwDate(url);
+    if (url.hostname !== "end-gfw.com" || url.pathname !== "/tweet-page" || !date) {
+      return null;
+    }
+    return {
+      title: "End GFW \u5DE5\u5177",
+      actions: [
+        {
+          id: "copy-tweet-id",
+          label: "\u590D\u5236\u63A8\u6587 ID",
+          description: "\u590D\u5236\u5F53\u524D\u64AD\u653E\u6216\u5F53\u524D\u53EF\u89C1\u63A8\u6587\u7684 ID",
+          activate: () => {
+            void copyCurrentTweetId(context).catch((error) => {
+              context.reportError(createSiteToolError("COPY_TWEET_ID_FAILED", error));
+            });
+          }
+        },
+        {
+          id: "previous-day",
+          label: "\u4E0A\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0A\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, -1)
+        },
+        {
+          id: "next-day",
+          label: "\u4E0B\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0B\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, 1)
+        }
+      ]
+    };
+  }
+  function parseEndGfwDate(url) {
+    const year = Number(url.searchParams.get("year"));
+    const month = Number(url.searchParams.get("month"));
+    const day = Number(url.searchParams.get("day"));
+    if (![year, month, day].every(Number.isInteger)) {
+      return null;
+    }
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month && date.getUTCDate() === day ? { year, month, day } : null;
+  }
+  function navigateToAdjacentDay(currentUrl, currentDate, offset) {
+    const date = new Date(
+      Date.UTC(currentDate.year, currentDate.month - 1, currentDate.day)
+    );
+    date.setUTCDate(date.getUTCDate() + offset);
+    const targetUrl = new URL(currentUrl.href);
+    targetUrl.searchParams.set("year", String(date.getUTCFullYear()));
+    targetUrl.searchParams.set(
+      "month",
+      String(date.getUTCMonth() + 1).padStart(2, "0")
+    );
+    targetUrl.searchParams.set("day", String(date.getUTCDate()).padStart(2, "0"));
+    window.location.assign(targetUrl.href);
+  }
+  async function copyCurrentTweetId(context) {
+    const currentArticle = context.getCurrentTextElement()?.closest(END_GFW_TWEET_SELECTOR);
+    const article = currentArticle ?? findNearestVisibleTweet();
+    const tweetId = article?.id.trim() ?? "";
+    if (!/^\d+$/u.test(tweetId)) {
+      throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u63D0\u53D6\u7684\u63A8\u6587 ID\u3002");
+    }
+    await writeClipboardText(tweetId);
+  }
+  function findNearestVisibleTweet() {
+    const viewportCenter = (window.visualViewport?.height ?? window.innerHeight) / 2;
+    let nearestArticle = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    const articles = Array.from(
+      document.querySelectorAll(END_GFW_TWEET_SELECTOR)
+    );
+    for (const article of articles) {
+      const rect = article.getBoundingClientRect();
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) {
+        continue;
+      }
+      const distance = Math.abs(rect.top + rect.height / 2 - viewportCenter);
+      if (distance < nearestDistance) {
+        nearestArticle = article;
+        nearestDistance = distance;
+      }
+    }
+    return nearestArticle;
+  }
+  async function writeClipboardText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.readOnly = true;
+      Object.assign(input.style, {
+        position: "fixed",
+        left: "-10000px",
+        top: "0"
+      });
+      document.documentElement.append(input);
+      input.select();
+      const copied = document.execCommand("copy");
+      input.remove();
+      if (!copied) {
+        throw new Error("\u590D\u5236\u63A8\u6587 ID \u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u6D4F\u89C8\u5668\u526A\u8D34\u677F\u6743\u9650\u3002");
+      }
+    }
+  }
+  function createSiteToolError(code, error) {
+    return {
+      code,
+      message: error instanceof Error ? error.message : String(error),
+      source: "content",
+      recoverable: true
+    };
+  }
+
   // src/content/content-script.ts
   function isSupportedPage(url) {
     return url.protocol === "http:" || url.protocol === "https:";
@@ -1752,6 +1736,7 @@
     initializePagePlayback(resolvePageAdapter(new URL(window.location.href)));
   }
   function initializePagePlayback(defaultAdapter) {
+    const pageSessionId = crypto.randomUUID();
     const errorFeedback = new ErrorFeedback();
     const visibleTextAdapter = new VisibleTextAdapter();
     let activeAdapter = defaultAdapter;
@@ -1777,6 +1762,7 @@
     let lastAutoSelectionText = "";
     let selectionTimer = null;
     let scanTimer = null;
+    let hasRegisteredPageSession = false;
     let settings = { ...DEFAULT_SETTINGS };
     let latestState = {
       status: "idle",
@@ -1786,6 +1772,10 @@
     };
     let keepAlivePort = null;
     let keepAliveTimer = null;
+    const siteToolPanel = resolveSiteToolPanel(new URL(window.location.href), {
+      getCurrentTextElement: () => currentItemId === null ? null : activeAdapter.findTextElement(currentItemId),
+      reportError: (error) => showError(error)
+    });
     const controlBar = new FloatingControlBar({
       onTogglePlayback() {
         void executePageCommand({ type: "page:toggle" });
@@ -1819,14 +1809,8 @@
           text,
           source: "input"
         });
-      },
-      onRateChange(rate) {
-        void saveSettings({ rate });
-      },
-      onVolumeChange(volume) {
-        void saveSettings({ volume });
       }
-    });
+    }, siteToolPanel, window.location.hostname === "end-gfw.com");
     async function executePlayerRequest(request) {
       try {
         renderPlaybackState(await sendRequest(request));
@@ -1836,7 +1820,7 @@
     }
     async function executePageCommand(request) {
       try {
-        await sendRequest({ type: "page:set-items", items });
+        await sendRequest({ type: "page:set-items", items, pageSessionId });
         renderPlaybackState(await sendRequest(request));
       } catch (error) {
         showError(createContentError("PAGE_COMMAND_FAILED", error));
@@ -1880,7 +1864,6 @@
       }
     }
     async function applyRuntimeSettings(nextSettings) {
-      controlBar.renderSettings(nextSettings);
       highlighter.renderColors(
         nextSettings.highlightBorderColor,
         nextSettings.highlightBackgroundColor
@@ -1952,8 +1935,13 @@
       items = nextItems;
       highlighter.refresh();
       renderNavigation();
-      if (previousSignature !== nextSignature) {
-        await executePlayerRequest({ type: "page:set-items", items });
+      if (!hasRegisteredPageSession || previousSignature !== nextSignature) {
+        await executePlayerRequest({
+          type: "page:set-items",
+          items,
+          pageSessionId
+        });
+        hasRegisteredPageSession = true;
       }
     }
     async function applyTextScanMode(nextSettings) {
@@ -1971,14 +1959,6 @@
       currentItemId = null;
       renderNavigation();
       await scanPage();
-    }
-    async function saveSettings(changes) {
-      try {
-        settings = await updateSettings(changes);
-        controlBar.renderSettings(settings);
-      } catch (error) {
-        showError(createContentError("SAVE_SETTINGS_FAILED", error));
-      }
     }
     function scheduleSelectionAutoPlay(event) {
       if (!settings.globalEnabled) {
@@ -2092,10 +2072,9 @@
     }).catch((error) => {
       showError(createContentError("LOAD_SETTINGS_FAILED", error));
     });
-    void scanPage().catch((error) => {
+    void scanPage().then(() => executePlayerRequest({ type: "player:get-state" })).catch((error) => {
       showError(createContentError("PAGE_SCAN_FAILED", error));
     });
-    void executePlayerRequest({ type: "player:get-state" });
   }
   function getSelectedText() {
     return window.getSelection()?.toString().replace(/\s+/g, " ").trim() ?? "";

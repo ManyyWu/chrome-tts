@@ -4,6 +4,8 @@ const CURRENT_CLASS = "chrome-tts-current-text";
 const STYLE_ID = "chrome-tts-page-highlight-style";
 const POSITION_HIGHLIGHT_NAME = "chrome-tts-current-position";
 const POSITION_OVERLAY_ID = "chrome-tts-position-overlay";
+const TEXT_COLOR_ATTRIBUTE = "data-chrome-tts-highlight-text-color";
+const TEXT_COLOR_VARIABLE = "--chrome-tts-highlight-text-color";
 
 interface CharacterRange {
   node: Text;
@@ -61,6 +63,10 @@ export class PageHighlighter {
           background: ${backgroundColor} !important;
           transition: background-color 120ms ease, outline-color 120ms ease !important;
         }
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}],
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}] * {
+          color: var(${TEXT_COLOR_VARIABLE}) !important;
+        }
         ::highlight(${POSITION_HIGHLIGHT_NAME}) {
           color: #063c2b;
           background-color: #6ee7b7;
@@ -80,8 +86,9 @@ export class PageHighlighter {
     const itemChanged = itemId !== this.currentItemId || element !== this.currentElement;
     if (itemChanged) {
       this.clearPosition();
-      this.currentElement?.classList.remove(CURRENT_CLASS);
+      this.removeCurrentElementStyles();
       element.classList.add(CURRENT_CLASS);
+      this.applyTextColor(element, itemId);
       element.scrollIntoView({ behavior: "smooth", block: "center" });
       this.currentElement = element;
       this.currentItemId = itemId;
@@ -90,19 +97,38 @@ export class PageHighlighter {
 
   /** 按规范化文本索引高亮当前字或词；使用 Range，不插入 span，不破坏网站框架状态。 */
   public highlightPosition(itemId: string, charIndex: number, length: number): void {
-    const element = this.adapter.findTextElement(itemId);
+    const rootElement = this.adapter.findTextElement(itemId);
     const registry = getHighlightRegistry();
-    if (!element) {
+    if (!rootElement) {
       return;
     }
+    const resolvedPosition = this.adapter.resolveTextDomPosition?.(
+      itemId,
+      charIndex,
+    );
+    if (this.adapter.resolveTextDomPosition && resolvedPosition === null) {
+      registry?.delete(POSITION_HIGHLIGHT_NAME);
+      this.positionOverlay.replaceChildren();
+      return;
+    }
+    const element = resolvedPosition?.element ?? rootElement;
     if (element !== this.mappedElement) {
       this.mappedElement = element;
       this.characterMap = createNormalizedCharacterMap(element);
     }
+    const textElementOffset = this.adapter.getTextElementCharOffset?.(itemId) ?? 0;
+    const elementCharIndex = resolvedPosition?.charIndex ??
+      charIndex - textElementOffset;
+    // 作者、时间等朗读前缀不属于正文 DOM，前缀播放期间只保留整段边框高亮。
+    if (elementCharIndex < 0) {
+      registry?.delete(POSITION_HIGHLIGHT_NAME);
+      this.positionOverlay.replaceChildren();
+      return;
+    }
     const characters = this.characterMap;
     const startIndex = Math.min(
       characters.length - 1,
-      Math.max(0, Math.trunc(charIndex)),
+      Math.max(0, Math.trunc(elementCharIndex)),
     );
     if (startIndex < 0) {
       return;
@@ -127,7 +153,7 @@ export class PageHighlighter {
   /** 清除当前正文高亮，同时忘记 DOM 引用，下一次播放同一条时仍会重新高亮。 */
   public clear(): void {
     this.clearPosition();
-    this.currentElement?.classList.remove(CURRENT_CLASS);
+    this.removeCurrentElementStyles();
     this.currentElement = null;
     this.currentItemId = null;
     this.mappedElement = null;
@@ -177,10 +203,27 @@ export class PageHighlighter {
     const replacement = this.adapter.findTextElement(this.currentItemId);
     if (replacement && replacement !== this.currentElement) {
       this.clearPosition();
-      this.currentElement?.classList.remove(CURRENT_CLASS);
+      this.removeCurrentElementStyles();
       replacement.classList.add(CURRENT_CLASS);
+      this.applyTextColor(replacement, this.currentItemId);
       this.currentElement = replacement;
     }
+  }
+
+  /** 仅当当前适配器明确要求时设置颜色变量，通用页面不产生额外样式覆盖。 */
+  private applyTextColor(element: HTMLElement, itemId: string): void {
+    const color = this.adapter.getHighlightTextColor?.(itemId) ?? null;
+    if (!color) {
+      return;
+    }
+    element.setAttribute(TEXT_COLOR_ATTRIBUTE, "");
+    element.style.setProperty(TEXT_COLOR_VARIABLE, color);
+  }
+
+  private removeCurrentElementStyles(): void {
+    this.currentElement?.classList.remove(CURRENT_CLASS);
+    this.currentElement?.removeAttribute(TEXT_COLOR_ATTRIBUTE);
+    this.currentElement?.style.removeProperty(TEXT_COLOR_VARIABLE);
   }
 }
 
