@@ -1,4 +1,5 @@
 import type { ExtensionError } from "../../shared/models";
+import type { ExtensionResponse } from "../../shared/messages";
 import type {
   SiteIntegration,
   SiteIntegrationContext,
@@ -41,6 +42,16 @@ function createTweetPageToolPanel(
   return {
     title: "End GFW 工具",
     actions: [
+      {
+        id: "open-x-tweet",
+        label: "跳转 X",
+        description: "在新标签页打开当前播放或当前可见的推文",
+        activate: () => {
+          void openCurrentTweetOnX(context).catch((error: unknown) => {
+            context.reportError(createSiteToolError("OPEN_X_TWEET_FAILED", error));
+          });
+        },
+      },
       {
         id: "copy-tweet-id",
         label: "复制推文 ID",
@@ -108,6 +119,24 @@ function navigateToAdjacentDay(
 async function copyCurrentTweetId(
   context: SiteIntegrationContext,
 ): Promise<void> {
+  await writeClipboardText(getCurrentTweetId(context));
+}
+
+/** 请求后台创建新标签页，避免 content script 的 window.open 被网页弹窗策略拦截。 */
+async function openCurrentTweetOnX(
+  context: SiteIntegrationContext,
+): Promise<void> {
+  const response = (await chrome.runtime.sendMessage({
+    type: "site:open-x-tweet",
+    tweetId: getCurrentTweetId(context),
+  })) as ExtensionResponse;
+  if (!response.ok) {
+    throw new Error(response.error ?? "无法打开 X 推文页面。");
+  }
+}
+
+/** 复制和跳转共用同一套定位规则，确保两个按钮针对同一条推文。 */
+function getCurrentTweetId(context: SiteIntegrationContext): string {
   const currentArticle = context
     .getCurrentTextElement()
     ?.closest<HTMLElement>(END_GFW_TWEET_SELECTOR);
@@ -116,7 +145,7 @@ async function copyCurrentTweetId(
   if (!/^\d+$/u.test(tweetId)) {
     throw new Error("当前页面没有可提取的推文 ID。");
   }
-  await writeClipboardText(tweetId);
+  return tweetId;
 }
 
 function findNearestVisibleTweet(): HTMLElement | null {

@@ -218,6 +218,14 @@ async function handleRequest(
         ),
       };
     }
+    case "site:open-x-tweet": {
+      // 使用不依赖作者用户名的稳定入口；X 会把该地址解析为实际推文页面。
+      await chrome.tabs.create({
+        url: `https://x.com/i/status/${request.tweetId}`,
+        active: true,
+      });
+      return { ok: true, state: player.getState() };
+    }
     case "player:stop":
       await clearPausedPlayback();
       return { ok: true, state: player.stop() };
