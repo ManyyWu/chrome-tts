@@ -14,7 +14,6 @@ export type ExtensionRequest =
   | { type: "page:play-from-position"; itemId: string; charIndex: number }
   | { type: "player:play-text"; text: string; source: "selection" | "input" }
   | { type: "site:play-caption"; text: string }
-  | { type: "site:open-x-tweet"; tweetId: string }
   | { type: "selection:auto-play"; text: string }
   | { type: "player:stop" }
   | { type: "player:get-state" }
@@ -78,15 +77,6 @@ export function isExtensionRequest(value: unknown): value is ExtensionRequest {
     );
   }
 
-  // 站点内容来自网页 DOM，只允许纯数字推文 ID，后台再拼接固定的 x.com 地址。
-  if (type === "site:open-x-tweet") {
-    return (
-      "tweetId" in value &&
-      typeof value.tweetId === "string" &&
-      /^\d+$/u.test(value.tweetId)
-    );
-  }
-
   if (type === "page:play-from-position") {
     return (
       "itemId" in value &&
@@ -128,7 +118,12 @@ function isPageTextItemArray(value: unknown): value is PageTextItem[] {
         "index" in item &&
         typeof item.index === "number" &&
         Number.isInteger(item.index) &&
-        item.index >= 0,
+        item.index >= 0 &&
+        (!("postPlaybackDelayMs" in item) ||
+          (typeof item.postPlaybackDelayMs === "number" &&
+            Number.isInteger(item.postPlaybackDelayMs) &&
+            item.postPlaybackDelayMs >= 0 &&
+            item.postPlaybackDelayMs <= 5000)),
     )
   );
 }

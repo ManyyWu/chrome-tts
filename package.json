@@ -1,10 +1,11 @@
 {
   "name": "chrome-tts",
-  "version": "1.4.0",
+  "version": "1.5.1",
   "private": true,
   "scripts": {
     "build": "esbuild src/settings.ts src/background/service-worker.ts src/content/content-script.ts --bundle --format=iife --target=chrome127 --outbase=src --outdir=dist",
     "check": "tsc --noEmit",
+    "package:release": "bash scripts/package-release.sh",
     "watch": "esbuild src/settings.ts src/background/service-worker.ts src/content/content-script.ts --bundle --format=iife --target=chrome127 --outbase=src --outdir=dist --watch"
   },
   "devDependencies": {

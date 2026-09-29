@@ -1,4 +1,8 @@
 import type { PageAdapter } from "./adapters/types";
+import {
+  createNormalizedCharacterMap,
+  type NormalizedCharacterRange,
+} from "./dom-text-mapping";
 
 const CURRENT_CLASS = "chrome-tts-current-text";
 const STYLE_ID = "chrome-tts-page-highlight-style";
@@ -6,12 +10,6 @@ const POSITION_HIGHLIGHT_NAME = "chrome-tts-current-position";
 const POSITION_OVERLAY_ID = "chrome-tts-position-overlay";
 const TEXT_COLOR_ATTRIBUTE = "data-chrome-tts-highlight-text-color";
 const TEXT_COLOR_VARIABLE = "--chrome-tts-highlight-text-color";
-
-interface CharacterRange {
-  node: Text;
-  startOffset: number;
-  endOffset: number;
-}
 
 /** TypeScript 现有 DOM 声明缺少 HighlightRegistry 的 Map 写操作，按实际 Chrome API 局部补齐。 */
 interface WritableHighlightRegistry {
@@ -24,7 +22,7 @@ export class PageHighlighter {
   private currentElement: HTMLElement | null = null;
   private currentItemId: string | null = null;
   private mappedElement: HTMLElement | null = null;
-  private characterMap: CharacterRange[] = [];
+  private characterMap: NormalizedCharacterRange[] = [];
   private readonly positionOverlay: HTMLDivElement;
   private readonly styleElement: HTMLStyleElement;
 
@@ -235,42 +233,4 @@ function getHighlightRegistry(): WritableHighlightRegistry | null {
   return typeof registry.set === "function" && typeof registry.delete === "function"
     ? registry
     : null;
-}
-
-/**
- * 把 DOM 文本节点映射为与通用适配器一致的“连续空白折叠为一个空格”字符序列。
- * 每个规范化字符保留原文本节点边界，供 CSS Highlight Range 精确定位。
- */
-function createNormalizedCharacterMap(element: HTMLElement): CharacterRange[] {
-  const characters: CharacterRange[] = [];
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-  let pendingWhitespace: CharacterRange | null = null;
-  let currentNode = walker.nextNode();
-
-  while (currentNode) {
-    const textNode = currentNode as Text;
-    const value = textNode.data;
-    for (let offset = 0; offset < value.length; offset += 1) {
-      const character: CharacterRange = {
-        node: textNode,
-        startOffset: offset,
-        endOffset: offset + 1,
-      };
-      if (/\s/u.test(value[offset] ?? "")) {
-        if (characters.length > 0 && pendingWhitespace === null) {
-          pendingWhitespace = character;
-        }
-        continue;
-      }
-
-      if (pendingWhitespace !== null) {
-        characters.push(pendingWhitespace);
-        pendingWhitespace = null;
-      }
-      characters.push(character);
-    }
-    currentNode = walker.nextNode();
-  }
-
-  return characters;
 }

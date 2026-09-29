@@ -12,7 +12,12 @@ type ControlIcon =
   | "settings"
   | "site-tools"
   | "drag"
+  | "compact"
   | "collapse";
+
+type ControlBarMode = "expanded" | "compact" | "collapsed";
+
+const COMPACT_STATE_STORAGE_PREFIX = "floatingControlBarCompact:";
 
 /** 控制栏把界面操作转换成回调，不直接依赖扩展消息或 chrome.tts。 */
 export interface FloatingControlBarActions {
@@ -36,18 +41,22 @@ export class FloatingControlBar {
   private readonly playButton: HTMLButtonElement;
   private readonly previousButton: HTMLButtonElement;
   private readonly nextButton: HTMLButtonElement;
+  private readonly collapseButton: HTMLButtonElement;
   private readonly inputPanel: HTMLDivElement;
   private readonly textInput: HTMLTextAreaElement;
   private readonly inputMessage: HTMLDivElement;
   private readonly siteToolPanel: HTMLDivElement;
   private readonly settingsOverlayHost: HTMLDivElement;
+  private readonly compactStateStorageKey: string;
   private readonly siteToolActionVisibility: Array<{
     button: HTMLButtonElement;
     isAvailable: () => boolean;
   }> = [];
   private hasPageItems = false;
   private isLoading = false;
-  private isCollapsed = false;
+  private mode: ControlBarMode = "expanded";
+  private modeRevision = 0;
+  private compactStateWriteQueue: Promise<void> = Promise.resolve();
   private isGloballyEnabled = true;
   private horizontalPositionRatio: number | null = null;
   private verticalPositionRatio: number | null = null;
@@ -57,7 +66,10 @@ export class FloatingControlBar {
     siteTools: SiteToolPanelConfig | null = null,
     startExpanded = false,
   ) {
-    this.isCollapsed = !startExpanded;
+    this.mode = startExpanded ? "expanded" : "collapsed";
+    // hostname 让同一网站的不同路径共享状态，同时不把完整 URL 写入扩展存储。
+    this.compactStateStorageKey =
+      `${COMPACT_STATE_STORAGE_PREFIX}${window.location.hostname.toLowerCase()}`;
     this.host = document.createElement("div");
     this.host.id = "chrome-tts-floating-control-bar";
 
@@ -77,9 +89,15 @@ export class FloatingControlBar {
     const selectionButton = this.createButton("selection", "播放选中文本");
     const textButton = this.createButton("text", "输入文本并播放");
     const settingsButton = this.createButton("settings", "打开设置");
-    const collapseButton = this.createButton("collapse", "收起快捷控制栏");
+    this.collapseButton = this.createButton("compact", "切换为简洁控制栏");
     const dragButton = this.createButton("drag", "拖动快捷控制栏");
     dragButton.classList.add("drag-button");
+
+    // 简洁态只保留站点工具、上一条、播放、下一条和二级收起按钮。
+    selectionButton.classList.add("expanded-only");
+    textButton.classList.add("expanded-only");
+    settingsButton.classList.add("expanded-only");
+    dragButton.classList.add("expanded-only");
 
     this.playButton.addEventListener("click", actions.onTogglePlayback);
     this.previousButton.addEventListener("click", actions.onPrevious);
@@ -87,7 +105,7 @@ export class FloatingControlBar {
     selectionButton.addEventListener("click", actions.onPlaySelection);
     textButton.addEventListener("click", () => this.toggleInputPanel());
     settingsButton.addEventListener("click", () => this.openSettingsPanel());
-    collapseButton.addEventListener("click", () => this.collapse());
+    this.collapseButton.addEventListener("click", () => this.advanceCollapseMode());
     this.initializeDragging(dragButton);
 
     if (siteTools !== null) {
@@ -103,7 +121,7 @@ export class FloatingControlBar {
       selectionButton,
       textButton,
       settingsButton,
-      collapseButton,
+      this.collapseButton,
       dragButton,
     );
 
@@ -190,16 +208,19 @@ export class FloatingControlBar {
     document.documentElement.append(this.launcherHost);
     document.documentElement.append(this.settingsOverlayHost);
     this.renderVisibility();
+    void this.restoreCompactState();
 
     // 拖动后使用固定 left/top；视口缩小时重新约束，避免控制栏留在不可见区域。
     const handleViewportResize = (): void => {
       window.requestAnimationFrame(() => {
         this.constrainToViewport();
+        this.constrainLauncherToViewport();
         this.constrainInputPanelToViewport();
       });
     };
     window.addEventListener("resize", handleViewportResize);
     window.visualViewport?.addEventListener("resize", handleViewportResize);
+    window.visualViewport?.addEventListener("scroll", handleViewportResize);
 
     // 捕获阶段监听可避免网站阻止冒泡后扩展无法感知外部点击。
     document.addEventListener(
@@ -322,7 +343,7 @@ export class FloatingControlBar {
   private constrainToViewport(requestedLeft?: number, requestedTop?: number): void {
     // 收起时元素没有布局尺寸。若此时读取 DOMRect，会得到 left=0、width=0，
     // 随后的约束会误把浮动条位置永久写成左侧安全边距。
-    if (this.host.hidden || this.isCollapsed) {
+    if (this.host.hidden || this.mode === "collapsed") {
       return;
     }
 
@@ -669,6 +690,10 @@ export class FloatingControlBar {
           }
         }
         break;
+      case "compact":
+        // “退出全屏”式四角图形表示从完整控制栏压缩为简洁控制栏。
+        appendShape("path", { d: "M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6" });
+        break;
       case "collapse":
         appendShape("path", { d: "m9 5 7 7-7 7" });
         break;
@@ -709,6 +734,10 @@ export class FloatingControlBar {
         border-radius: 12px;
         background: rgb(255 255 255 / 96%);
         box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
+      }
+
+      .control-bar.is-compact .expanded-only {
+        display: none;
       }
 
       .control-button,
@@ -911,7 +940,7 @@ export class FloatingControlBar {
     return style;
   }
 
-  /** 启动图标使用独立 fixed 宿主，始终固定在窗口右下角且不继承浮动条拖动位置。 */
+  /** 启动图标使用独立 fixed 宿主，始终固定在窗口右上角且不继承浮动条拖动位置。 */
   private createLauncher(): HTMLDivElement {
     const host = document.createElement("div");
     host.id = "chrome-tts-collapsed-launcher";
@@ -923,7 +952,7 @@ export class FloatingControlBar {
         all: initial;
         position: fixed;
         right: max(16px, env(safe-area-inset-right));
-        bottom: max(16px, env(safe-area-inset-bottom));
+        top: max(16px, env(safe-area-inset-top));
         z-index: 2147483647;
         display: block;
         color-scheme: light;
@@ -972,23 +1001,117 @@ export class FloatingControlBar {
     return host;
   }
 
-  private collapse(): void {
-    // 隐藏前记录当前位置；隐藏后的元素无法提供有效的布局坐标。
+  /**
+   * 完整控制栏第一次点击进入简洁态，第二次点击才完全隐藏。
+   * 每次改变尺寸前记录相对位置，改变后再按新尺寸约束，避免靠近底部或右侧时越界。
+   */
+  private advanceCollapseMode(): void {
+    this.modeRevision += 1;
     const currentRect = this.controlBarElement.getBoundingClientRect();
     this.constrainToViewport(currentRect.left, currentRect.top);
-    this.isCollapsed = true;
     this.closeAllPanels();
+
+    if (this.mode === "expanded") {
+      this.mode = "compact";
+      this.queueCompactStateWrite(true);
+      this.renderVisibility();
+      window.requestAnimationFrame(() => this.constrainToViewport());
+      return;
+    }
+
+    this.mode = "collapsed";
+    this.queueCompactStateWrite(false);
     this.renderVisibility();
   }
 
   private expand(): void {
-    this.isCollapsed = false;
+    this.modeRevision += 1;
+    this.mode = "expanded";
+    this.queueCompactStateWrite(false);
     this.renderVisibility();
     window.requestAnimationFrame(() => this.constrainToViewport());
   }
 
+  /**
+   * 页面初始化时只识别值为 true 的简洁态标记。读取完成前若用户已操作浮动条，
+   * 通过 revision 放弃旧读取结果，防止异步恢复覆盖用户刚刚选择的新状态。
+   */
+  private async restoreCompactState(): Promise<void> {
+    const revisionAtStart = this.modeRevision;
+    try {
+      const stored = await chrome.storage.local.get(this.compactStateStorageKey);
+      if (
+        this.modeRevision !== revisionAtStart ||
+        stored[this.compactStateStorageKey] !== true
+      ) {
+        return;
+      }
+
+      this.mode = "compact";
+      this.renderVisibility();
+      window.requestAnimationFrame(() => this.constrainToViewport());
+    } catch {
+      // 状态持久化属于辅助功能；存储不可用时保留站点原有默认显示状态。
+    }
+  }
+
+  /**
+   * 只有简洁态写入 true；完整态和隐藏态删除键，因此 storage 中不存在其他状态。
+   * 写操作串行执行，保证快速连续点击后最后一次状态不会被较早的异步写入覆盖。
+   */
+  private queueCompactStateWrite(isCompact: boolean): void {
+    this.compactStateWriteQueue = this.compactStateWriteQueue
+      .then(async () => {
+        if (isCompact) {
+          await chrome.storage.local.set({ [this.compactStateStorageKey]: true });
+        } else {
+          await chrome.storage.local.remove(this.compactStateStorageKey);
+        }
+      })
+      .catch(() => {
+        // 存储失败不阻断浮动条当前页面内的状态切换。
+      });
+  }
+
+  /**
+   * 启动图标以 CSS 固定在右上角；额外根据 visualViewport 校正缩放和平移后的可见区域。
+   * 这能覆盖移动端地址栏变化、窗口缩放和页面放大后布局视口与可视视口不一致的情况。
+   */
+  private constrainLauncherToViewport(): void {
+    if (this.launcherHost.hidden) {
+      return;
+    }
+
+    this.launcherHost.style.transform = "none";
+    const rect = this.launcherHost.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft ?? 0;
+    const viewportTop = viewport?.offsetTop ?? 0;
+    const viewportWidth = viewport?.width ?? document.documentElement.clientWidth;
+    const safeMargin = 16;
+    const desiredLeft = viewportLeft + viewportWidth - rect.width - safeMargin;
+    const desiredTop = viewportTop + safeMargin;
+    this.launcherHost.style.transform =
+      `translate(${desiredLeft - rect.left}px, ${desiredTop - rect.top}px)`;
+  }
+
+  /** 同步三种显示状态，并为两级收起动作设置不同图标和辅助说明。 */
   private renderVisibility(): void {
-    this.host.hidden = !this.isGloballyEnabled || this.isCollapsed;
-    this.launcherHost.hidden = !this.isGloballyEnabled || !this.isCollapsed;
+    const isCollapsed = this.mode === "collapsed";
+    this.host.hidden = !this.isGloballyEnabled || isCollapsed;
+    this.launcherHost.hidden = !this.isGloballyEnabled || !isCollapsed;
+    this.controlBarElement.classList.toggle("is-compact", this.mode === "compact");
+
+    const collapseIcon: ControlIcon = this.mode === "compact" ? "collapse" : "compact";
+    const collapseDescription = this.mode === "compact"
+      ? "隐藏快捷控制栏"
+      : "切换为简洁控制栏";
+    this.collapseButton.replaceChildren(this.createIcon(collapseIcon));
+    this.collapseButton.title = collapseDescription;
+    this.collapseButton.setAttribute("aria-label", collapseDescription);
+
+    if (!this.launcherHost.hidden) {
+      window.requestAnimationFrame(() => this.constrainLauncherToViewport());
+    }
   }
 }

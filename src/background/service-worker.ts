@@ -218,14 +218,6 @@ async function handleRequest(
         ),
       };
     }
-    case "site:open-x-tweet": {
-      // 使用不依赖作者用户名的稳定入口；X 会把该地址解析为实际推文页面。
-      await chrome.tabs.create({
-        url: `https://x.com/i/status/${request.tweetId}`,
-        active: true,
-      });
-      return { ok: true, state: player.getState() };
-    }
     case "player:stop":
       await clearPausedPlayback();
       return { ok: true, state: player.stop() };
@@ -677,7 +669,35 @@ async function continuePageQueue(
     return;
   }
 
+  const completedItem = queue.items[completedIndex];
+  const delayMs = completedItem?.postPlaybackDelayMs ?? 0;
+  if (delayMs > 0) {
+    await waitForPlaybackDelay(delayMs);
+
+    // 等待期间用户可能停止、跳转条目、关闭标签或在其他标签开始播放。
+    // 只有播放归属和完成条目均未变化时，旧的自动推进任务才有权继续。
+    const latestState = player.getState();
+    const latestQueue = pageQueues.get(tabId);
+    if (
+      activePlaybackTabId !== tabId ||
+      latestState.status !== "completed" ||
+      latestState.source !== "page" ||
+      latestState.itemId !== completedState.itemId ||
+      latestQueue !== queue ||
+      latestQueue.currentIndex !== completedIndex
+    ) {
+      return;
+    }
+  }
+
   await playPageItem(tabId, nextIndex);
+}
+
+/** 一秒级短暂停顿使用 worker 定时器；完成后仍必须重新校验播放器状态。 */
+async function waitForPlaybackDelay(delayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
 }
 
 function requirePageQueue(tabId: number): PageQueue {

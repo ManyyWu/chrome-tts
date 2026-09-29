@@ -18,10 +18,15 @@ import {
   SETTINGS_KEY,
 } from "../shared/settings";
 import { ErrorFeedback } from "./error-feedback";
+import { FilteredTextDecorator } from "./filtered-text-decorator";
 import { FloatingControlBar } from "./floating-control-bar";
 import { PageHighlighter } from "./page-highlighter";
 import { SelectionJumpPrompt } from "./selection-jump-prompt";
+import { applySiteContentScope } from "./site-content-scope";
+import { resolveSiteContentScope } from "./site-content-scope-registry";
 import { resolveSiteIntegration } from "./site-tool-panel";
+import { filterPageTextItems, type SiteTextFilter } from "./text-filter";
+import { resolveSiteTextFilter } from "./text-filter-registry";
 
 /** 通用模式支持所有普通 HTTP/HTTPS 页面；浏览器内部页面不允许注入 content script。 */
 function isSupportedPage(url: URL): boolean {
@@ -50,17 +55,29 @@ async function sendRequest(request: ExtensionRequest): Promise<PlaybackState> {
   return response.state;
 }
 
-if (isSupportedPage(new URL(window.location.href))) {
-  initializePagePlayback(resolvePageAdapter(new URL(window.location.href)));
+const initialPageUrl = new URL(window.location.href);
+if (isSupportedPage(initialPageUrl)) {
+  initializePagePlayback(
+    resolvePageAdapter(initialPageUrl),
+    resolveSiteTextFilter(initialPageUrl),
+  );
 }
 
 /** 初始化通用页面队列、QuickPanel、高亮、动态扫描和自动选择播放。 */
-function initializePagePlayback(defaultAdapter: PageAdapter): void {
+function initializePagePlayback(
+  defaultAdapter: PageAdapter,
+  textFilter: SiteTextFilter | null,
+): void {
   // 每次文档加载生成新标识，弥补 Edge Android 可能漏发 tabs.onUpdated 的情况。
   let pageSessionId = crypto.randomUUID();
   const errorFeedback = new ErrorFeedback();
   const visibleTextAdapter = new VisibleTextAdapter();
+  const contentScope = resolveSiteContentScope(initialPageUrl);
   let activeAdapter: PageAdapter = defaultAdapter;
+  let sourceIndexesByItemId = new Map<
+    string,
+    readonly number[] | null
+  >();
   // 高亮器始终通过代理访问当前模式，避免修改其既有生命周期和 DOM 映射逻辑。
   const adapterProxy: PageAdapter = {
     id: "active-adapter-proxy",
@@ -75,16 +92,54 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     getTextElementCharOffset: (itemId) =>
       activeAdapter.getTextElementCharOffset?.(itemId) ?? 0,
     resolveTextDomPosition: (itemId, charIndex) => {
+      if (sourceIndexesByItemId.has(itemId)) {
+        const sourceIndexes = sourceIndexesByItemId.get(itemId) ?? null;
+        // “跳过”等生成文本没有对应 DOM 字符，播放期间只保留整段边框高亮。
+        if (sourceIndexes === null || sourceIndexes.length === 0) {
+          return null;
+        }
+        const boundedIndex = Math.min(
+          sourceIndexes.length - 1,
+          Math.max(0, Math.trunc(charIndex)),
+        );
+        const sourceCharIndex = sourceIndexes[boundedIndex];
+        if (sourceCharIndex === undefined) {
+          return null;
+        }
+        if (activeAdapter.resolveTextDomPosition) {
+          return activeAdapter.resolveTextDomPosition(itemId, sourceCharIndex);
+        }
+        const element = activeAdapter.findTextElement(itemId);
+        return element ? { element, charIndex: sourceCharIndex } : null;
+      }
       if (activeAdapter.resolveTextDomPosition) {
         return activeAdapter.resolveTextDomPosition(itemId, charIndex);
       }
       const element = activeAdapter.findTextElement(itemId);
       return element ? { element, charIndex } : null;
     },
-    findSelectionPosition: (selection) =>
-      activeAdapter.findSelectionPosition(selection),
+    findSelectionPosition: (selection) => {
+      const position = activeAdapter.findSelectionPosition(selection);
+      if (!position || !sourceIndexesByItemId.has(position.itemId)) {
+        return position;
+      }
+      const sourceIndexes = sourceIndexesByItemId.get(position.itemId) ?? null;
+      if (sourceIndexes === null || sourceIndexes.length === 0) {
+        return { ...position, charIndex: 0 };
+      }
+      const filteredIndex = sourceIndexes.findIndex(
+        (sourceIndex) => sourceIndex >= position.charIndex,
+      );
+      return {
+        ...position,
+        charIndex: filteredIndex >= 0
+          ? filteredIndex
+          : Math.max(0, sourceIndexes.length - 1),
+      };
+    },
   };
   const highlighter = new PageHighlighter(adapterProxy);
+  const filteredTextDecorator = new FilteredTextDecorator(adapterProxy);
   const selectionJumpPrompt = new SelectionJumpPrompt((position) => {
     void executePageCommand({
       type: "page:play-from-position",
@@ -347,7 +402,16 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
   /** 扫描结果只有发生实质变化时才发送，避免 MutationObserver 产生无效队列更新。 */
   async function scanPage(): Promise<void> {
     const scanningAdapter = activeAdapter;
-    const nextItems = scanningAdapter.scanTextItems();
+    const scopedItems = applySiteContentScope(
+      scanningAdapter.scanTextItems(),
+      scanningAdapter,
+      contentScope,
+    );
+    const filteredScan = filterPageTextItems(
+      scopedItems,
+      textFilter,
+    );
+    const nextItems = filteredScan.items;
     // 设置切换可能与延迟扫描并发，旧适配器结果不得覆盖新模式队列。
     if (scanningAdapter !== activeAdapter) {
       return;
@@ -372,15 +436,22 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
       }
       highlighter.clear();
       items = [];
+      sourceIndexesByItemId = new Map();
       currentItemId = null;
       hasRegisteredPageSession = false;
       renderNavigation();
     }
+    sourceIndexesByItemId = filteredScan.sourceIndexesByItemId;
+    filteredTextDecorator.render(filteredScan.removedRangesByItemId);
     const previousSignature = items
-      .map((item) => `${item.id}:${item.text}`)
+      .map((item) =>
+        `${item.id}:${item.text}:${item.postPlaybackDelayMs ?? 0}`
+      )
       .join("|");
     const nextSignature = nextItems
-      .map((item) => `${item.id}:${item.text}`)
+      .map((item) =>
+        `${item.id}:${item.text}:${item.postPlaybackDelayMs ?? 0}`
+      )
       .join("|");
     items = nextItems;
     highlighter.refresh();
@@ -417,6 +488,7 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
     activeAdapter = nextAdapter;
     activeQueueContextId = null;
     items = [];
+    sourceIndexesByItemId = new Map();
     currentItemId = null;
     renderNavigation();
     await scanPage();

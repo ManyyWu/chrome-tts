@@ -1,5 +1,4 @@
 import type { ExtensionError } from "../../shared/models";
-import type { ExtensionResponse } from "../../shared/messages";
 import type {
   SiteIntegration,
   SiteIntegrationContext,
@@ -12,8 +11,8 @@ interface EndGfwDate {
   day: number;
 }
 
-const END_GFW_TWEET_SELECTOR =
-  'article[id][itemscope][itemtype="http://schema.org/SocialMediaPosting"]';
+const END_GFW_TWEET_SELECTOR = "main article";
+const X_STATUS_LINK_SELECTOR = 'a[href*="/status/"]';
 
 /** End GFW 的全部特殊行为集中于此，注册入口只负责匹配和调度。 */
 export const endGfwSiteIntegration: SiteIntegration = {
@@ -29,13 +28,17 @@ export const endGfwSiteIntegration: SiteIntegration = {
   },
 };
 
-/** 工具仅在具有合法年月日参数的 tweet-page 页面启用。 */
+/** 工具仅在具有合法 date 参数的 tweets 打印页面启用。 */
 function createTweetPageToolPanel(
   url: URL,
   context: SiteIntegrationContext,
 ): SiteToolPanelConfig | null {
   const date = parseEndGfwDate(url);
-  if (url.pathname !== "/tweet-page" || !date) {
+  if (
+    url.pathname !== "/tweets" ||
+    url.searchParams.get("view") !== "print" ||
+    !date
+  ) {
     return null;
   }
 
@@ -43,19 +46,9 @@ function createTweetPageToolPanel(
     title: "End GFW 工具",
     actions: [
       {
-        id: "open-x-tweet",
-        label: "跳转 X",
-        description: "在新标签页打开当前播放或当前可见的推文",
-        activate: () => {
-          void openCurrentTweetOnX(context).catch((error: unknown) => {
-            context.reportError(createSiteToolError("OPEN_X_TWEET_FAILED", error));
-          });
-        },
-      },
-      {
         id: "copy-tweet-id",
         label: "复制推文 ID",
-        description: "复制当前播放或当前可见推文的 ID",
+        description: "复制当前播放或当前可见推文链接中的 ID",
         activate: () => {
           void copyCurrentTweetId(context).catch((error: unknown) => {
             context.reportError(createSiteToolError("COPY_TWEET_ID_FAILED", error));
@@ -78,14 +71,17 @@ function createTweetPageToolPanel(
   };
 }
 
-/** 严格校验年月日，避免 Date 自动把 2 月 30 日归一化成其他日期。 */
+/** 严格解析 YYYY-MM-DD，避免 Date 自动把 2 月 30 日归一化成其他日期。 */
 function parseEndGfwDate(url: URL): EndGfwDate | null {
-  const year = Number(url.searchParams.get("year"));
-  const month = Number(url.searchParams.get("month"));
-  const day = Number(url.searchParams.get("day"));
-  if (![year, month, day].every(Number.isInteger)) {
+  const rawDate = url.searchParams.get("date") ?? "";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(rawDate);
+  if (!match) {
     return null;
   }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
 
   const date = new Date(Date.UTC(year, month - 1, day));
   return date.getUTCFullYear() === year &&
@@ -95,7 +91,7 @@ function parseEndGfwDate(url: URL): EndGfwDate | null {
     : null;
 }
 
-/** 保留 id 等其他查询参数，只替换日期，并正确处理跨月、跨年和闰年。 */
+/** 保留 view 等其他查询参数，只替换 date，并正确处理跨月、跨年和闰年。 */
 function navigateToAdjacentDay(
   currentUrl: URL,
   currentDate: EndGfwDate,
@@ -106,12 +102,12 @@ function navigateToAdjacentDay(
   );
   date.setUTCDate(date.getUTCDate() + offset);
   const targetUrl = new URL(currentUrl.href);
-  targetUrl.searchParams.set("year", String(date.getUTCFullYear()));
-  targetUrl.searchParams.set(
-    "month",
+  const nextDate = [
+    String(date.getUTCFullYear()).padStart(4, "0"),
     String(date.getUTCMonth() + 1).padStart(2, "0"),
-  );
-  targetUrl.searchParams.set("day", String(date.getUTCDate()).padStart(2, "0"));
+    String(date.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+  targetUrl.searchParams.set("date", nextDate);
   window.location.assign(targetUrl.href);
 }
 
@@ -122,30 +118,51 @@ async function copyCurrentTweetId(
   await writeClipboardText(getCurrentTweetId(context));
 }
 
-/** 请求后台创建新标签页，避免 content script 的 window.open 被网页弹窗策略拦截。 */
-async function openCurrentTweetOnX(
-  context: SiteIntegrationContext,
-): Promise<void> {
-  const response = (await chrome.runtime.sendMessage({
-    type: "site:open-x-tweet",
-    tweetId: getCurrentTweetId(context),
-  })) as ExtensionResponse;
-  if (!response.ok) {
-    throw new Error(response.error ?? "无法打开 X 推文页面。");
-  }
-}
-
-/** 复制和跳转共用同一套定位规则，确保两个按钮针对同一条推文。 */
+/**
+ * 新版页面不再把推文 ID 放在 article.id 中，因此从文章内的 X status 链接提取。
+ * “查看原文”对应当前推文，优先级高于“查看引用原文”，避免复制到被引用推文的 ID。
+ */
 function getCurrentTweetId(context: SiteIntegrationContext): string {
   const currentArticle = context
     .getCurrentTextElement()
     ?.closest<HTMLElement>(END_GFW_TWEET_SELECTOR);
   const article = currentArticle ?? findNearestVisibleTweet();
-  const tweetId = article?.id.trim() ?? "";
-  if (!/^\d+$/u.test(tweetId)) {
-    throw new Error("当前页面没有可提取的推文 ID。");
+  if (!article) {
+    throw new Error("当前页面没有可识别的推文。");
   }
-  return tweetId;
+
+  const links = Array.from(
+    article.querySelectorAll<HTMLAnchorElement>(X_STATUS_LINK_SELECTOR),
+  );
+  const primaryLink = links.find(
+    (link) => link.textContent?.replace(/\s+/gu, "") === "查看原文",
+  );
+  const orderedLinks = primaryLink
+    ? [primaryLink, ...links.filter((link) => link !== primaryLink)]
+    : links;
+
+  for (const link of orderedLinks) {
+    const tweetId = extractTweetIdFromStatusLink(link);
+    if (tweetId) {
+      return tweetId;
+    }
+  }
+
+  throw new Error("当前推文没有可提取 ID 的 X 链接。");
+}
+
+/** 只接受 x.com 的 status 链接，避免从页面中的无关链接提取数字。 */
+function extractTweetIdFromStatusLink(link: HTMLAnchorElement): string | null {
+  try {
+    const url = new URL(link.href, window.location.href);
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== "x.com" && hostname !== "www.x.com") {
+      return null;
+    }
+    return /\/status\/(\d+)(?:\/|$)/u.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function findNearestVisibleTweet(): HTMLElement | null {

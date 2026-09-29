@@ -37,6 +37,8 @@ export interface PageTextItem {
   id: string;
   text: string;
   index: number;
+  /** 当前条目正常播放完成后，自动进入下一条前需要等待的毫秒数。 */
+  postPlaybackDelayMs?: number;
 }
 
 /** 可跨运行环境传递的结构化错误，避免界面依赖任意 Error 对象。 */
