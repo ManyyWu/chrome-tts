@@ -68,3 +68,8 @@ cp "$CRX_PATH" "$DEPLOY_ROOT/chrome-tts-$VERSION.crx"
 
 echo "发布包：$CRX_PATH"
 echo "本地插件目录：$DEPLOY_ROOT"
+
+# 只有上述检查、构建、打包和本地同步全部成功后才发送成功通知。
+# 通知失败返回非零退出码，但保留已经生成和同步的发布文件。
+node scripts/notify-discord.mjs "$VERSION" "$CRX_PATH" \
+  "${CHROME_TTS_DISCORD_CONFIG:-$PROJECT_ROOT/release/discord-webhook.pem}"

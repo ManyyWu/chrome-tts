@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Chrome TTS</title>
+
+  <style>
+    body {
+      box-sizing: border-box;
+      width: 360px;
+      margin: 0;
+      padding: 16px;
+      color: #202124;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 18px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 7px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    select,
+    input,
+    button {
+      box-sizing: border-box;
+      width: 100%;
+    }
+
+    select {
+      min-height: 36px;
+      padding: 6px;
+      border: 1px solid #c7cacf;
+      border-radius: 7px;
+    }
+
+    select:disabled {
+      border-color: #dadce0;
+      color: #80868b;
+      background: #f1f3f4;
+      cursor: not-allowed;
+      opacity: 1;
+    }
+
+    input[type="range"] {
+      accent-color: #1a73e8;
+    }
+
+    input[type="color"] {
+      height: 36px;
+      padding: 3px;
+      border: 1px solid #c7cacf;
+      border-radius: 7px;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    .checkbox-field {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .checkbox-field input {
+      flex: 0 0 auto;
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: #1a73e8;
+    }
+
+    #settings-error {
+      margin: 4px 0 14px;
+      padding: 9px 10px;
+      border-radius: 7px;
+      color: #7d1b16;
+      background: #fce8e6;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    #settings-error[hidden] {
+      display: none;
+    }
+
+    #test-actions:not(:empty) {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #e0e3e7;
+    }
+
+    .test-button {
+      padding: 9px;
+      border: 1px solid #c7cacf;
+      border-radius: 7px;
+      color: #7d1b16;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    .test-button:hover {
+      background: #fce8e6;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Chrome TTS 设置</h1>
+
+  <div id="settings-error" role="alert" hidden></div>
+
+  <div class="field checkbox-field">
+    <input id="global-enabled" type="checkbox">
+    <label for="global-enabled">激活插件</label>
+  </div>
+
+  <div class="field">
+    <div class="field-header">
+      <label for="voice">声音</label>
+    </div>
+    <select id="voice"></select>
+  </div>
+
+  <div class="field">
+    <div class="field-header">
+      <label for="rate">语速</label>
+      <output id="rate-value" for="rate">1×</output>
+    </div>
+    <input id="rate" type="range" min="0.5" max="1.5" step="0.1" value="1">
+  </div>
+
+  <div class="field">
+    <div class="field-header">
+      <label for="volume">音量</label>
+      <output id="volume-value" for="volume">100%</output>
+    </div>
+    <input id="volume" type="range" min="0" max="1" step="0.05" value="1">
+  </div>
+
+  <div class="field">
+    <div class="field-header">
+      <label for="highlight-border-color">高亮边框颜色</label>
+    </div>
+    <input id="highlight-border-color" type="color" value="#22a06b">
+  </div>
+
+  <div class="field">
+    <div class="field-header">
+      <label for="highlight-background-color">高亮背景颜色</label>
+    </div>
+    <input id="highlight-background-color" type="color" value="#e6f6ef">
+  </div>
+
+  <div class="field checkbox-field">
+    <input id="auto-play-selection" type="checkbox">
+    <label for="auto-play-selection">选择网页文本后自动播放</label>
+  </div>
+
+  <div class="field checkbox-field">
+    <input id="show-selection-jump-prompt" type="checkbox">
+    <label for="show-selection-jump-prompt">选择文本时弹出跳转提示</label>
+  </div>
+
+  <div class="field checkbox-field">
+    <input id="play-all-visible-text" type="checkbox">
+    <label for="play-all-visible-text">播放所有可见文本</label>
+  </div>
+
+  <div id="test-actions"></div>
+
+  <script src="dist/settings.js"></script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 import type { ExtensionError, PlaybackState } from "../shared/models";
 import { endGfwSiteIntegration } from "./sites/end-gfw-site";
+import { redditSiteIntegration } from "./sites/reddit-site";
 import { youtubeSiteIntegration } from "./sites/youtube-site";
 
 /** 浮动条只消费该配置，不感知具体网站、DOM 选择器或 URL 规则。 */
@@ -20,6 +21,7 @@ export interface SiteToolAction {
 export interface SiteIntegrationContext {
   getCurrentTextElement(): HTMLElement | null;
   reportError(error: ExtensionError): void;
+  showNotice(message: string): void;
   playCaption(text: string): void;
   stopPlayback(): void;
   subscribePlaybackState(listener: (state: PlaybackState) => void): () => void;
@@ -46,6 +48,7 @@ export interface SiteIntegration {
 /** 新增网站适配时只需新增独立文件并在此注册。顺序代表匹配优先级。 */
 const SITE_INTEGRATIONS: readonly SiteIntegration[] = [
   endGfwSiteIntegration,
+  redditSiteIntegration,
   youtubeSiteIntegration,
 ];
 

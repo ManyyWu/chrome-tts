@@ -7,6 +7,10 @@ import type { ExtensionError } from "../shared/models";
 export class ErrorFeedback {
   private readonly host: HTMLDivElement;
   private readonly messageElement: HTMLDivElement;
+  private readonly toastElement: HTMLDivElement;
+  private readonly confirmButton: HTMLButtonElement;
+  private requiresConfirmation = false;
+  private readonly pendingNotifications: Array<() => void> = [];
   private hideTimer: number | null = null;
   private lastErrorKey = "";
   private lastShownAt = 0;
@@ -48,12 +52,42 @@ export class ErrorFeedback {
         line-height: 1.45;
         word-break: break-word;
       }
+
+      .toast.success {
+        border-color: #16a34a;
+        color: #166534;
+        background: #ecfdf3;
+      }
+
+      button {
+        display: block;
+        margin: 10px auto 0;
+        padding: 6px 18px;
+        border: 1px solid #b3261e;
+        border-radius: 6px;
+        background: #fff;
+        color: #7d1b16;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button[hidden] { display: none; }
     `;
 
     this.messageElement = document.createElement("div");
-    this.messageElement.className = "toast";
-    this.messageElement.setAttribute("role", "alert");
-    shadowRoot.append(style, this.messageElement);
+    this.toastElement = document.createElement("div");
+    this.toastElement.className = "toast";
+    this.toastElement.setAttribute("role", "alert");
+    this.confirmButton = document.createElement("button");
+    this.confirmButton.type = "button";
+    this.confirmButton.textContent = "确认";
+    this.confirmButton.hidden = true;
+    this.confirmButton.addEventListener("click", () => {
+      this.requiresConfirmation = false;
+      this.hideAndShowNext();
+    });
+    this.toastElement.append(this.messageElement, this.confirmButton);
+    shadowRoot.append(style, this.toastElement);
     document.documentElement.append(this.host);
 
     // 鼠标悬停时保持错误可见，移出后重新开始 5 秒倒计时。
@@ -63,12 +97,21 @@ export class ErrorFeedback {
 
   /** 显示错误；一秒内完全相同的错误只刷新倒计时，不重复播放提示音。 */
   public show(error: ExtensionError): void {
+    // 待确认错误不能被后续成功通知或其他错误覆盖。
+    if (this.requiresConfirmation) {
+      this.pendingNotifications.push(() => this.show(error));
+      return;
+    }
     const now = Date.now();
     const errorKey = `${error.code}:${error.message}`;
     const isDuplicate = errorKey === this.lastErrorKey && now - this.lastShownAt < 1000;
 
     this.lastErrorKey = errorKey;
     this.lastShownAt = now;
+    this.requiresConfirmation = error.requiresConfirmation === true;
+    this.confirmButton.hidden = !this.requiresConfirmation;
+    this.toastElement.classList.remove("success");
+    this.toastElement.setAttribute("role", "alert");
     this.messageElement.textContent = error.message;
     this.host.hidden = false;
     this.scheduleHide();
@@ -76,6 +119,20 @@ export class ErrorFeedback {
     if (!isDuplicate) {
       void this.playErrorTone();
     }
+  }
+
+  /** 复用顶部 toast 样式和自动隐藏计时；普通操作通知不播放错误提示音。 */
+  public showNotice(message: string): void {
+    if (this.requiresConfirmation) {
+      this.pendingNotifications.push(() => this.showNotice(message));
+      return;
+    }
+    this.confirmButton.hidden = true;
+    this.toastElement.classList.add("success");
+    this.toastElement.setAttribute("role", "status");
+    this.messageElement.textContent = message;
+    this.host.hidden = false;
+    this.scheduleHide();
   }
 
   /** 使用两个短振荡器音调生成提示音，不依赖远程或二进制音频资源。 */
@@ -107,10 +164,17 @@ export class ErrorFeedback {
   /** 重新安排自动隐藏，保证最新错误拥有完整阅读时间。 */
   private scheduleHide(): void {
     this.clearHideTimer();
+    if (this.requiresConfirmation) return;
     this.hideTimer = window.setTimeout(() => {
-      this.host.hidden = true;
-      this.hideTimer = null;
+      this.hideAndShowNext();
     }, 5000);
+  }
+
+  /** 关闭当前通知后依次展示排队消息，保留尚未确认的失败信息。 */
+  private hideAndShowNext(): void {
+    this.clearHideTimer();
+    this.host.hidden = true;
+    this.pendingNotifications.shift()?.();
   }
 
   private clearHideTimer(): void {

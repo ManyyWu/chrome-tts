@@ -43,6 +43,8 @@ export interface PageTextItem {
 
 /** 可跨运行环境传递的结构化错误，避免界面依赖任意 Error 对象。 */
 export interface ExtensionError {
+  /** 需要用户确认时保持通知可见，避免关键操作失败被自动隐藏。 */
+  requiresConfirmation?: boolean;
   code: string;
   message: string;
   source: "content" | "player" | "tts" | "settings" | "test";

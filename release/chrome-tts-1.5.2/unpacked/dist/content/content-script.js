@@ -1,0 +1,3717 @@
+"use strict";
+(() => {
+  // src/content/adapters/generic-page-adapter.ts
+  var CANDIDATE_SELECTOR = "h1, h2, h3, h4, h5, h6, p, li, blockquote, figcaption, td, th";
+  var EXCLUDED_ANCESTOR_SELECTOR = "nav, header, footer, aside, form, dialog, button, input, textarea, select, script, style, noscript, template, [hidden], [aria-hidden='true'], #chrome-tts-floating-control-bar, #chrome-tts-error-feedback, #chrome-tts-selection-jump-prompt, #chrome-tts-position-overlay, #chrome-tts-collapsed-launcher";
+  var GenericPageAdapter = class {
+    id = "generic";
+    priority = 0;
+    elementsById = /* @__PURE__ */ new Map();
+    matches(_url) {
+      return true;
+    }
+    /** 扫描可见块级文本，过滤页面框架、重复父子内容和无意义短文本。 */
+    scanTextItems() {
+      this.elementsById.clear();
+      const root = this.findContentRoot();
+      const candidates = Array.from(
+        root.querySelectorAll(CANDIDATE_SELECTOR)
+      );
+      const acceptedElements = candidates.filter(
+        (element) => this.isAcceptedElement(element)
+      );
+      const acceptedSet = new Set(acceptedElements);
+      const seenText = /* @__PURE__ */ new Set();
+      const items = [];
+      for (const element of acceptedElements) {
+        if (Array.from(element.querySelectorAll(CANDIDATE_SELECTOR)).some(
+          (child) => child !== element && acceptedSet.has(child)
+        )) {
+          continue;
+        }
+        const text = normalizeText(element.innerText);
+        if (seenText.has(text)) {
+          continue;
+        }
+        seenText.add(text);
+        const id = `generic:${createDomPath(element)}:${hashText(text)}`;
+        const item = { id, text, index: items.length };
+        items.push(item);
+        this.elementsById.set(id, element);
+      }
+      return items;
+    }
+    findTextElement(itemId) {
+      const element = this.elementsById.get(itemId) ?? null;
+      return element?.isConnected === true ? element : null;
+    }
+    /** 把选区起点转换为规范化段落文本中的字符位置，供“跳转”从该处开始播放。 */
+    findSelectionPosition(selection) {
+      if (selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
+      }
+      const selectedRange = selection.getRangeAt(0);
+      for (const [itemId, element] of this.elementsById) {
+        if (!element.contains(selectedRange.startContainer)) {
+          continue;
+        }
+        const prefixRange = document.createRange();
+        prefixRange.selectNodeContents(element);
+        try {
+          prefixRange.setEnd(
+            selectedRange.startContainer,
+            selectedRange.startOffset
+          );
+        } catch {
+          return null;
+        }
+        const fullText = normalizeText(element.innerText);
+        const normalizedPrefix = prefixRange.toString().replace(/\s+/g, " ").trimStart();
+        return {
+          itemId,
+          charIndex: Math.min(fullText.length, normalizedPrefix.length)
+        };
+      }
+      return null;
+    }
+    /** 优先正文语义容器；没有时才扫描 body，减少导航和侧栏进入队列的概率。 */
+    findContentRoot() {
+      const main = document.querySelector("main");
+      if (main) {
+        return main;
+      }
+      const roleMain = document.querySelector("[role='main']");
+      if (roleMain) {
+        return roleMain;
+      }
+      const articles = document.querySelectorAll("article");
+      return articles.length === 1 ? articles[0] ?? document.body : document.body;
+    }
+    isAcceptedElement(element) {
+      if (element.closest(EXCLUDED_ANCESTOR_SELECTOR)) {
+        return false;
+      }
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+      const text = normalizeText(element.innerText);
+      const isHeading = /^H[1-6]$/.test(element.tagName);
+      const minimumLength = isHeading ? 2 : 5;
+      return text.length >= minimumLength && text.length <= 32768 && /[\p{L}\p{N}]/u.test(text);
+    }
+  };
+  function normalizeText(text) {
+    return text.replace(/\s+/g, " ").trim();
+  }
+  function createDomPath(element) {
+    const segments = [];
+    let current = element;
+    while (current && current !== document.body) {
+      const parent = current.parentElement;
+      const siblings = parent ? Array.from(parent.children).filter(
+        (sibling) => sibling.tagName === current?.tagName
+      ) : [];
+      const position = Math.max(0, siblings.indexOf(current)) + 1;
+      segments.push(`${current.tagName.toLowerCase()}[${position}]`);
+      current = parent;
+    }
+    return segments.reverse().join("/");
+  }
+  function hashText(text) {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  // src/content/sites/x-site.ts
+  var TWEET_SELECTOR = 'article[data-testid="tweet"]';
+  var TWEET_TEXT_SELECTOR = '[data-testid="tweetText"]';
+  var USER_NAME_SELECTOR = '[data-testid="User-Name"]';
+  var SHOW_MORE_SELECTOR = '[data-testid="tweet-text-show-more-link"]';
+  var MAX_CACHED_TWEETS = 2e3;
+  var XPageAdapter = class {
+    id = "x";
+    priority = 100;
+    snapshots = /* @__PURE__ */ new Map();
+    orderedIds = [];
+    elementsById = /* @__PURE__ */ new Map();
+    requestedExpansions = /* @__PURE__ */ new WeakSet();
+    baseQueueContextId = "";
+    queueContextRevision = 0;
+    topAnchorTweetId = null;
+    pendingInteractionReset = false;
+    constructor() {
+      document.addEventListener("click", this.handleTimelineControlClick, true);
+    }
+    matches(url) {
+      return url.hostname === "x.com" || url.hostname.endsWith(".x.com");
+    }
+    getQueueContextId() {
+      const base = this.baseQueueContextId || createTimelineContextId();
+      return `${base}:revision-${this.queueContextRevision}`;
+    }
+    /** 扫描当前虚拟窗口，并将新出现的推文合并进不会随 DOM 回收而缩短的队列。 */
+    scanTextItems() {
+      const nextQueueContextId = createTimelineContextId();
+      if (this.baseQueueContextId && this.baseQueueContextId !== nextQueueContextId || this.pendingInteractionReset) {
+        this.resetQueue();
+      }
+      this.pendingInteractionReset = false;
+      this.baseQueueContextId = nextQueueContextId;
+      this.elementsById.clear();
+      const observedIds = [];
+      const visibleTimelineIds = [];
+      const articles = Array.from(
+        document.querySelectorAll(TWEET_SELECTOR)
+      );
+      for (const article of articles) {
+        const visibleTweetId = extractArticleTweetId(article);
+        if (visibleTweetId) {
+          visibleTimelineIds.push(`x:${visibleTweetId}`);
+        }
+        if (this.expandTruncatedTweetContent(article)) {
+          continue;
+        }
+        const extracted = extractTweet(article);
+        if (extracted === null) {
+          continue;
+        }
+        observedIds.push(extracted.snapshot.id);
+        this.snapshots.set(extracted.snapshot.id, extracted.snapshot);
+        this.elementsById.set(extracted.snapshot.id, article);
+      }
+      const firstObservedId = visibleTimelineIds[0] ?? null;
+      const isNearTimelineTop = window.scrollY <= 600;
+      if (isNearTimelineTop && firstObservedId !== null && this.topAnchorTweetId !== null && firstObservedId !== this.topAnchorTweetId) {
+        const currentSnapshots = observedIds.flatMap((id) => {
+          const snapshot = this.snapshots.get(id);
+          return snapshot ? [[id, snapshot]] : [];
+        });
+        this.resetQueue();
+        for (const [id, snapshot] of currentSnapshots) {
+          this.snapshots.set(id, snapshot);
+        }
+      }
+      if (isNearTimelineTop && firstObservedId !== null) {
+        this.topAnchorTweetId = firstObservedId;
+      }
+      this.mergeObservedOrder(observedIds);
+      this.limitCache();
+      return this.orderedIds.flatMap((id, index) => {
+        const snapshot = this.snapshots.get(id);
+        return snapshot ? [{ id, text: snapshot.text, index }] : [];
+      });
+    }
+    /** 排序方式或新推文刷新属于同一标签内的数据源替换，需要在下一次扫描前失效队列。 */
+    handleTimelineControlClick = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      const menuItem = target.closest('[role="menuitem"]');
+      const menuText = normalizeText2(
+        menuItem?.closest('[role="menu"]')?.innerText ?? ""
+      ).toLowerCase();
+      const isSortSelection = menuItem !== null && (menuText.includes("\u6392\u5E8F\u65B9\u5F0F") || menuText.includes("sort by"));
+      const control = target.closest('button, [role="button"]');
+      const controlText = normalizeText2(
+        `${control?.innerText ?? ""} ${control?.getAttribute("aria-label") ?? ""}`
+      ).toLowerCase();
+      const isTimelineRefresh = control !== null && (/新推文|刷新/u.test(controlText) || controlText.includes("new posts") || controlText.includes("show posts") || controlText.includes("refresh"));
+      if (isSortSelection || isTimelineRefresh) {
+        this.pendingInteractionReset = true;
+      }
+    };
+    resetQueue() {
+      this.snapshots.clear();
+      this.orderedIds.splice(0);
+      this.elementsById.clear();
+      this.topAnchorTweetId = null;
+      this.queueContextRevision += 1;
+    }
+    findTextElement(itemId) {
+      const element = this.elementsById.get(itemId) ?? null;
+      return element?.isConnected === true ? element : null;
+    }
+    /** X 默认深色主题的浅色文字在浅绿背景上对比不足，高亮期间改为近黑色。 */
+    getHighlightTextColor(_itemId) {
+      return "#111111";
+    }
+    getTextElementCharOffset(itemId) {
+      return this.snapshots.get(itemId)?.segments[0]?.start ?? 0;
+    }
+    /** 作者、时间和“引用内容”没有正文 DOM；正文位置则映射到主推文或引用正文。 */
+    resolveTextDomPosition(itemId, charIndex) {
+      const segment = this.snapshots.get(itemId)?.segments.find(
+        (candidate) => charIndex >= candidate.start && charIndex < candidate.start + candidate.length
+      );
+      return segment ? { element: segment.element, charIndex: charIndex - segment.start } : null;
+    }
+    /**
+     * “显示更多”按钮存在时，剩余正文尚未进入 tweetText。主正文和引用正文都需要
+     * 完整展开；WeakSet 防止 DOM 更新前的密集扫描重复触发同一按钮。
+     */
+    expandTruncatedTweetContent(article) {
+      const showMoreButtons = Array.from(
+        article.querySelectorAll(SHOW_MORE_SELECTOR)
+      );
+      if (showMoreButtons.length === 0) {
+        return false;
+      }
+      const time = article.querySelector("time");
+      const permalink = time?.closest('a[href*="/status/"]');
+      const tweetId = extractTweetId(permalink?.getAttribute("href") ?? "");
+      if (tweetId) {
+        const itemId = `x:${tweetId}`;
+        this.snapshots.delete(itemId);
+        const itemIndex = this.orderedIds.indexOf(itemId);
+        if (itemIndex >= 0) {
+          this.orderedIds.splice(itemIndex, 1);
+        }
+      }
+      for (const showMoreButton of showMoreButtons) {
+        if (!this.requestedExpansions.has(showMoreButton)) {
+          this.requestedExpansions.add(showMoreButton);
+          showMoreButton.click();
+        }
+      }
+      return true;
+    }
+    /** 选区位于主正文或引用正文时，转换为完整组合话语中的字符位置。 */
+    findSelectionPosition(selection) {
+      if (selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
+      }
+      const range = selection.getRangeAt(0);
+      for (const [itemId, snapshot] of this.snapshots) {
+        for (const segment of snapshot.segments) {
+          if (!segment.element.contains(range.startContainer)) {
+            continue;
+          }
+          const prefixRange = document.createRange();
+          prefixRange.selectNodeContents(segment.element);
+          try {
+            prefixRange.setEnd(range.startContainer, range.startOffset);
+          } catch {
+            return null;
+          }
+          const normalizedPrefix = normalizeText2(prefixRange.toString());
+          return {
+            itemId,
+            charIndex: segment.start + normalizedPrefix.length
+          };
+        }
+      }
+      return null;
+    }
+    /**
+     * 用已知相邻推文作为锚点合并新 ID。向下滚动时追加，向上重新加载时插回已知项
+     * 之前；同一推文无论节点重建多少次都只保留一个队列条目。
+     */
+    mergeObservedOrder(observedIds) {
+      let previousObservedId = null;
+      for (let index = 0; index < observedIds.length; index += 1) {
+        const id = observedIds[index];
+        if (!id) {
+          continue;
+        }
+        if (this.orderedIds.includes(id)) {
+          previousObservedId = id;
+          continue;
+        }
+        const previousIndex = previousObservedId === null ? -1 : this.orderedIds.indexOf(previousObservedId);
+        if (previousIndex >= 0) {
+          this.orderedIds.splice(previousIndex + 1, 0, id);
+        } else {
+          const nextKnownId = observedIds.slice(index + 1).find((candidate) => this.orderedIds.includes(candidate));
+          const nextKnownIndex = nextKnownId ? this.orderedIds.indexOf(nextKnownId) : -1;
+          if (nextKnownIndex >= 0) {
+            this.orderedIds.splice(nextKnownIndex, 0, id);
+          } else {
+            this.orderedIds.push(id);
+          }
+        }
+        previousObservedId = id;
+      }
+    }
+    /** 限制长时间滚动的内存占用；优先淘汰已经不在当前虚拟窗口中的最早条目。 */
+    limitCache() {
+      while (this.orderedIds.length > MAX_CACHED_TWEETS) {
+        const removableIndex = this.orderedIds.findIndex(
+          (id) => !this.elementsById.has(id)
+        );
+        if (removableIndex < 0) {
+          return;
+        }
+        const [removedId] = this.orderedIds.splice(removableIndex, 1);
+        if (removedId) {
+          this.snapshots.delete(removedId);
+        }
+      }
+    }
+  };
+  function extractTweet(article) {
+    const mainTime = article.querySelector("time");
+    const permalink = mainTime?.closest('a[href*="/status/"]');
+    const tweetId = extractTweetId(permalink?.getAttribute("href") ?? "");
+    if (!mainTime || !permalink || !tweetId) {
+      return null;
+    }
+    const textElement = Array.from(
+      article.querySelectorAll(TWEET_TEXT_SELECTOR)
+    ).find((element) => element.closest('[role="link"]') === null) ?? null;
+    if (textElement === null) {
+      return null;
+    }
+    const author = extractAuthor(article);
+    const time = normalizeText2(mainTime.textContent ?? "");
+    const body = normalizeText2(textElement.innerText);
+    if (!author || !time || !body) {
+      return null;
+    }
+    const prefix = `${author}\u3002${time}\u3002`;
+    let speechText = `${prefix}${body}`;
+    const segments = [
+      { element: textElement, start: prefix.length, length: body.length }
+    ];
+    const quotedTextElement = Array.from(
+      article.querySelectorAll(TWEET_TEXT_SELECTOR)
+    ).find((element) => element.closest('[role="link"]') !== null) ?? null;
+    if (quotedTextElement !== null) {
+      const quotedContainer = quotedTextElement.closest('[role="link"]');
+      const quotedTimeElement = quotedContainer?.querySelector("time");
+      const quotedAuthor = quotedContainer ? extractAuthor(quotedContainer) : "";
+      const quotedTime = normalizeText2(quotedTimeElement?.textContent ?? "");
+      const quotedBody = normalizeText2(quotedTextElement.innerText);
+      if (quotedAuthor && quotedTime && quotedBody) {
+        const quoteIntroduction = "\u3002\u5F15\u7528\u5185\u5BB9\u3002";
+        const quotedPrefix = `${quotedAuthor}\u3002${quotedTime}\u3002`;
+        const quotedBodyStart = speechText.length + quoteIntroduction.length + quotedPrefix.length;
+        speechText += `${quoteIntroduction}${quotedPrefix}${quotedBody}`;
+        segments.push({
+          element: quotedTextElement,
+          start: quotedBodyStart,
+          length: quotedBody.length
+        });
+      }
+    }
+    return {
+      snapshot: {
+        id: `x:${tweetId}`,
+        text: speechText,
+        segments
+      }
+    };
+  }
+  function extractAuthor(article) {
+    const userName = article.querySelector(USER_NAME_SELECTOR);
+    const nameLink = userName?.querySelector('a[role="link"]');
+    const linkedName = normalizeText2(nameLink?.innerText ?? "");
+    if (linkedName) {
+      return linkedName;
+    }
+    return (userName?.innerText ?? "").split(/\r?\n/u).map(normalizeText2).find((line) => line && !line.startsWith("@") && line !== "\xB7") ?? "";
+  }
+  function extractTweetId(href) {
+    return href.match(/\/status\/(\d+)(?:$|[/?#])/u)?.[1] ?? null;
+  }
+  function extractArticleTweetId(article) {
+    const time = article.querySelector("time");
+    const permalink = time?.closest('a[href*="/status/"]');
+    return extractTweetId(permalink?.getAttribute("href") ?? "");
+  }
+  function normalizeText2(text) {
+    return text.replace(/\s+/gu, " ").trim();
+  }
+  function createTimelineContextId() {
+    const selectedTab = document.querySelector(
+      '[data-testid="ScrollSnap-List"] [role="tab"][aria-selected="true"]'
+    );
+    const tabList = selectedTab?.closest('[role="tablist"]');
+    const tabs = tabList ? Array.from(tabList.querySelectorAll('[role="tab"]')) : [];
+    const selectedIndex = selectedTab ? tabs.indexOf(selectedTab) : -1;
+    const selectedLabel = normalizeText2(selectedTab?.innerText ?? "none");
+    return `${window.location.pathname}:${selectedIndex}:${selectedLabel}`;
+  }
+
+  // src/content/adapters/adapter-resolver.ts
+  function resolvePageAdapter(url) {
+    const adapters = [
+      new XPageAdapter(),
+      new GenericPageAdapter()
+    ];
+    const matched = adapters.filter((adapter) => adapter.matches(url)).sort((first, second) => second.priority - first.priority)[0];
+    if (!matched) {
+      throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u7528\u7684\u6587\u672C\u9002\u914D\u5668\u3002");
+    }
+    return matched;
+  }
+
+  // src/content/adapters/visible-text-adapter.ts
+  var EXCLUDED_SELECTOR = "script, style, noscript, template, [hidden], [aria-hidden='true'], input, textarea, select, option, #chrome-tts-floating-control-bar, #chrome-tts-error-feedback, #chrome-tts-selection-jump-prompt, #chrome-tts-position-overlay, #chrome-tts-collapsed-launcher";
+  var VisibleTextAdapter = class {
+    id = "visible-text";
+    priority = 0;
+    elementsById = /* @__PURE__ */ new Map();
+    matches(_url) {
+      return true;
+    }
+    /** 遍历普通 DOM 中已渲染的文本节点，并按文档顺序生成播放条目。 */
+    scanTextItems() {
+      this.elementsById.clear();
+      const textNodesByGroup = /* @__PURE__ */ new Map();
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: (node2) => this.isVisibleTextNode(node2) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+        }
+      );
+      let node = walker.nextNode();
+      while (node) {
+        const group = this.findTextGroup(node);
+        if (group) {
+          const groupedNodes = textNodesByGroup.get(group) ?? [];
+          groupedNodes.push(node);
+          textNodesByGroup.set(group, groupedNodes);
+        }
+        node = walker.nextNode();
+      }
+      const groupsWithNestedGroups = /* @__PURE__ */ new Set();
+      for (const group of textNodesByGroup.keys()) {
+        let ancestor = group.parentElement;
+        while (ancestor && ancestor !== document.body) {
+          if (textNodesByGroup.has(ancestor)) {
+            groupsWithNestedGroups.add(ancestor);
+          }
+          ancestor = ancestor.parentElement;
+        }
+      }
+      const items = [];
+      for (const [element, groupedNodes] of textNodesByGroup) {
+        const text = groupsWithNestedGroups.has(element) ? normalizeText3(groupedNodes.map((node2) => node2.data).join(" ")) : normalizeText3(element.innerText);
+        if (!text || text.length > 32768) {
+          continue;
+        }
+        const id = `visible:${createDomPath2(element)}:${hashText2(text)}`;
+        items.push({ id, text, index: items.length });
+        this.elementsById.set(id, element);
+      }
+      return items;
+    }
+    findTextElement(itemId) {
+      const element = this.elementsById.get(itemId) ?? null;
+      return element?.isConnected === true ? element : null;
+    }
+    /** 将选区起点映射到当前可见文本条目的规范化字符索引。 */
+    findSelectionPosition(selection) {
+      if (selection.rangeCount === 0 || selection.isCollapsed) {
+        return null;
+      }
+      const selectedRange = selection.getRangeAt(0);
+      for (const [itemId, element] of this.elementsById) {
+        if (!element.contains(selectedRange.startContainer)) {
+          continue;
+        }
+        const prefixRange = document.createRange();
+        prefixRange.selectNodeContents(element);
+        try {
+          prefixRange.setEnd(
+            selectedRange.startContainer,
+            selectedRange.startOffset
+          );
+        } catch {
+          return null;
+        }
+        const fullText = normalizeText3(element.innerText);
+        const normalizedPrefix = prefixRange.toString().replace(/\s+/g, " ").trimStart();
+        return {
+          itemId,
+          charIndex: Math.min(fullText.length, normalizedPrefix.length)
+        };
+      }
+      return null;
+    }
+    /** 文本节点及其父元素必须实际渲染，隐藏区域和扩展自身界面全部排除。 */
+    isVisibleTextNode(node) {
+      if (!node.data.trim()) {
+        return false;
+      }
+      const parent = node.parentElement;
+      if (!parent || parent.closest(EXCLUDED_SELECTOR)) {
+        return false;
+      }
+      let element = parent;
+      while (element) {
+        const style = window.getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0" || style.contentVisibility === "hidden") {
+          return false;
+        }
+        element = element.parentElement;
+      }
+      return parent.getClientRects().length > 0;
+    }
+    /** 优先最近的块级或可交互容器，使朗读分段接近页面视觉分组。 */
+    findTextGroup(node) {
+      let element = node.parentElement;
+      while (element && element !== document.body) {
+        const display = window.getComputedStyle(element).display;
+        if (element.matches(
+          "button, label, summary, h1, h2, h3, h4, h5, h6, p, li, blockquote, figcaption, td, th, dt, dd, pre"
+        ) || display === "block" || display === "flex" || display === "grid" || display === "list-item" || display === "table-cell") {
+          return element;
+        }
+        element = element.parentElement;
+      }
+      return node.parentElement;
+    }
+  };
+  function normalizeText3(text) {
+    return text.replace(/\s+/g, " ").trim();
+  }
+  function createDomPath2(element) {
+    const segments = [];
+    let current = element;
+    while (current && current !== document.body) {
+      const parent = current.parentElement;
+      const siblings = parent ? Array.from(parent.children).filter(
+        (sibling) => sibling.tagName === current?.tagName
+      ) : [];
+      const position = Math.max(0, siblings.indexOf(current)) + 1;
+      segments.push(`${current.tagName.toLowerCase()}[${position}]`);
+      current = parent;
+    }
+    return segments.reverse().join("/");
+  }
+  function hashText2(text) {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  // src/shared/settings.ts
+  var SETTINGS_KEY = "extensionSettings";
+  var DEFAULT_SETTINGS = {
+    version: 6,
+    voiceName: null,
+    voiceExtensionId: null,
+    lang: null,
+    rate: 1,
+    volume: 1,
+    highlightBorderColor: "#22a06b",
+    highlightBackgroundColor: "#e6f6ef",
+    autoPlaySelection: false,
+    showSelectionJumpPrompt: false,
+    playAllVisibleText: false,
+    globalEnabled: true
+  };
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+  function isNullableString(value) {
+    return value === null || typeof value === "string";
+  }
+  function normalizeColor(value, fallback) {
+    return typeof value === "string" && /^#[0-9a-f]{6}$/iu.test(value) ? value.toLowerCase() : fallback;
+  }
+  function normalizeSettings(value) {
+    if (typeof value !== "object" || value === null) {
+      return { ...DEFAULT_SETTINGS };
+    }
+    const stored = value;
+    const rate = typeof stored.rate === "number" && Number.isFinite(stored.rate) ? clamp(Math.round(stored.rate * 10) / 10, 0.5, 1.5) : DEFAULT_SETTINGS.rate;
+    const volume = typeof stored.volume === "number" && Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : DEFAULT_SETTINGS.volume;
+    return {
+      version: 6,
+      voiceName: isNullableString(stored.voiceName) ? stored.voiceName : DEFAULT_SETTINGS.voiceName,
+      voiceExtensionId: isNullableString(stored.voiceExtensionId) ? stored.voiceExtensionId : DEFAULT_SETTINGS.voiceExtensionId,
+      lang: isNullableString(stored.lang) ? stored.lang : DEFAULT_SETTINGS.lang,
+      rate,
+      volume,
+      highlightBorderColor: normalizeColor(
+        stored.highlightBorderColor,
+        DEFAULT_SETTINGS.highlightBorderColor
+      ),
+      highlightBackgroundColor: normalizeColor(
+        stored.highlightBackgroundColor,
+        DEFAULT_SETTINGS.highlightBackgroundColor
+      ),
+      autoPlaySelection: typeof stored.autoPlaySelection === "boolean" ? stored.autoPlaySelection : DEFAULT_SETTINGS.autoPlaySelection,
+      showSelectionJumpPrompt: typeof stored.showSelectionJumpPrompt === "boolean" ? stored.showSelectionJumpPrompt : DEFAULT_SETTINGS.showSelectionJumpPrompt,
+      playAllVisibleText: typeof stored.playAllVisibleText === "boolean" ? stored.playAllVisibleText : DEFAULT_SETTINGS.playAllVisibleText,
+      globalEnabled: typeof stored.globalEnabled === "boolean" ? stored.globalEnabled : DEFAULT_SETTINGS.globalEnabled
+    };
+  }
+  async function loadSettings() {
+    const result = await chrome.storage.local.get(SETTINGS_KEY);
+    const storedValue = result[SETTINGS_KEY];
+    const settings = normalizeSettings(storedValue);
+    if (JSON.stringify(storedValue) !== JSON.stringify(settings)) {
+      await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+    }
+    return settings;
+  }
+
+  // src/content/error-feedback.ts
+  var ErrorFeedback = class {
+    host;
+    messageElement;
+    toastElement;
+    confirmButton;
+    requiresConfirmation = false;
+    pendingNotifications = [];
+    hideTimer = null;
+    lastErrorKey = "";
+    lastShownAt = 0;
+    constructor() {
+      this.host = document.createElement("div");
+      this.host.id = "chrome-tts-error-feedback";
+      this.host.hidden = true;
+      const shadowRoot = this.host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        all: initial;
+        position: fixed;
+        top: 18px;
+        left: 50%;
+        z-index: 2147483647;
+        transform: translateX(-50%);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      /* all: initial \u4F1A\u8986\u76D6\u6D4F\u89C8\u5668\u5BF9 hidden \u5C5E\u6027\u7684\u9ED8\u8BA4 display: none\uFF0C\u5FC5\u987B\u663E\u5F0F\u6062\u590D\u3002 */
+      :host([hidden]) {
+        display: none;
+      }
+
+      .toast {
+        box-sizing: border-box;
+        max-width: min(560px, calc(100vw - 32px));
+        padding: 11px 16px;
+        border: 1px solid rgb(179 38 30 / 35%);
+        border-radius: 9px;
+        color: #7d1b16;
+        background: #fce8e6;
+        box-shadow: 0 5px 20px rgb(0 0 0 / 20%);
+        font-size: 14px;
+        font-weight: 600;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+
+      .toast.success {
+        border-color: #16a34a;
+        color: #166534;
+        background: #ecfdf3;
+      }
+
+      button {
+        display: block;
+        margin: 10px auto 0;
+        padding: 6px 18px;
+        border: 1px solid #b3261e;
+        border-radius: 6px;
+        background: #fff;
+        color: #7d1b16;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button[hidden] { display: none; }
+    `;
+      this.messageElement = document.createElement("div");
+      this.toastElement = document.createElement("div");
+      this.toastElement.className = "toast";
+      this.toastElement.setAttribute("role", "alert");
+      this.confirmButton = document.createElement("button");
+      this.confirmButton.type = "button";
+      this.confirmButton.textContent = "\u786E\u8BA4";
+      this.confirmButton.hidden = true;
+      this.confirmButton.addEventListener("click", () => {
+        this.requiresConfirmation = false;
+        this.hideAndShowNext();
+      });
+      this.toastElement.append(this.messageElement, this.confirmButton);
+      shadowRoot.append(style, this.toastElement);
+      document.documentElement.append(this.host);
+      this.host.addEventListener("mouseenter", () => this.clearHideTimer());
+      this.host.addEventListener("mouseleave", () => this.scheduleHide());
+    }
+    /** 显示错误；一秒内完全相同的错误只刷新倒计时，不重复播放提示音。 */
+    show(error) {
+      if (this.requiresConfirmation) {
+        this.pendingNotifications.push(() => this.show(error));
+        return;
+      }
+      const now = Date.now();
+      const errorKey = `${error.code}:${error.message}`;
+      const isDuplicate = errorKey === this.lastErrorKey && now - this.lastShownAt < 1e3;
+      this.lastErrorKey = errorKey;
+      this.lastShownAt = now;
+      this.requiresConfirmation = error.requiresConfirmation === true;
+      this.confirmButton.hidden = !this.requiresConfirmation;
+      this.toastElement.classList.remove("success");
+      this.toastElement.setAttribute("role", "alert");
+      this.messageElement.textContent = error.message;
+      this.host.hidden = false;
+      this.scheduleHide();
+      if (!isDuplicate) {
+        void this.playErrorTone();
+      }
+    }
+    /** 复用顶部 toast 样式和自动隐藏计时；普通操作通知不播放错误提示音。 */
+    showNotice(message) {
+      if (this.requiresConfirmation) {
+        this.pendingNotifications.push(() => this.showNotice(message));
+        return;
+      }
+      this.confirmButton.hidden = true;
+      this.toastElement.classList.add("success");
+      this.toastElement.setAttribute("role", "status");
+      this.messageElement.textContent = message;
+      this.host.hidden = false;
+      this.scheduleHide();
+    }
+    /** 使用两个短振荡器音调生成提示音，不依赖远程或二进制音频资源。 */
+    async playErrorTone() {
+      try {
+        const audioContext = new AudioContext();
+        await audioContext.resume();
+        const gain = audioContext.createGain();
+        gain.gain.setValueAtTime(1e-4, audioContext.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.12, audioContext.currentTime + 0.01);
+        gain.gain.exponentialRampToValueAtTime(1e-4, audioContext.currentTime + 0.22);
+        gain.connect(audioContext.destination);
+        const oscillator = audioContext.createOscillator();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(520, audioContext.currentTime);
+        oscillator.frequency.setValueAtTime(390, audioContext.currentTime + 0.1);
+        oscillator.connect(gain);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + 0.23);
+        oscillator.addEventListener("ended", () => {
+          void audioContext.close();
+        });
+      } catch {
+      }
+    }
+    /** 重新安排自动隐藏，保证最新错误拥有完整阅读时间。 */
+    scheduleHide() {
+      this.clearHideTimer();
+      if (this.requiresConfirmation) return;
+      this.hideTimer = window.setTimeout(() => {
+        this.hideAndShowNext();
+      }, 5e3);
+    }
+    /** 关闭当前通知后依次展示排队消息，保留尚未确认的失败信息。 */
+    hideAndShowNext() {
+      this.clearHideTimer();
+      this.host.hidden = true;
+      this.pendingNotifications.shift()?.();
+    }
+    clearHideTimer() {
+      if (this.hideTimer !== null) {
+        window.clearTimeout(this.hideTimer);
+        this.hideTimer = null;
+      }
+    }
+  };
+
+  // src/content/dom-text-mapping.ts
+  function createNormalizedCharacterMap(element) {
+    const characters = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let pendingWhitespace = null;
+    let currentNode = walker.nextNode();
+    while (currentNode) {
+      const textNode = currentNode;
+      const value = textNode.data;
+      for (let offset = 0; offset < value.length; offset += 1) {
+        const character = {
+          node: textNode,
+          startOffset: offset,
+          endOffset: offset + 1
+        };
+        if (/\s/u.test(value[offset] ?? "")) {
+          if (characters.length > 0 && pendingWhitespace === null) {
+            pendingWhitespace = character;
+          }
+          continue;
+        }
+        if (pendingWhitespace !== null) {
+          characters.push(pendingWhitespace);
+          pendingWhitespace = null;
+        }
+        characters.push(character);
+      }
+      currentNode = walker.nextNode();
+    }
+    return characters;
+  }
+
+  // src/content/filtered-text-decorator.ts
+  var FILTERED_TEXT_HIGHLIGHT_NAME = "chrome-tts-filtered-text";
+  var FILTERED_TEXT_STYLE_ID = "chrome-tts-filtered-text-style";
+  var FilteredTextDecorator = class {
+    constructor(adapter) {
+      this.adapter = adapter;
+      const existingStyle = document.getElementById(FILTERED_TEXT_STYLE_ID);
+      this.styleElement = existingStyle instanceof HTMLStyleElement ? existingStyle : document.createElement("style");
+      if (!this.styleElement.isConnected) {
+        this.styleElement.id = FILTERED_TEXT_STYLE_ID;
+        document.documentElement.append(this.styleElement);
+      }
+      this.styleElement.textContent = `
+      ::highlight(${FILTERED_TEXT_HIGHLIGHT_NAME}) {
+        color: #7f1d1d;
+        background-color: rgb(255 228 230 / 88%);
+        text-decoration-line: line-through;
+        text-decoration-color: #b42318;
+        text-decoration-thickness: 2px;
+      }
+    `;
+    }
+    styleElement;
+    /** 每次扫描重建全部 Range，兼容页面动态替换文章节点。 */
+    render(removedRangesByItemId) {
+      const registry = getHighlightRegistry();
+      if (!registry) {
+        return;
+      }
+      const ranges = [];
+      for (const [itemId, sourceRanges] of removedRangesByItemId) {
+        const element = this.adapter.findTextElement(itemId);
+        if (!element) {
+          continue;
+        }
+        const characters = createNormalizedCharacterMap(element);
+        for (const sourceRange of sourceRanges) {
+          const range = createDomRange(characters, sourceRange);
+          if (range) {
+            ranges.push(range);
+          }
+        }
+      }
+      if (ranges.length === 0) {
+        registry.delete(FILTERED_TEXT_HIGHLIGHT_NAME);
+        return;
+      }
+      registry.set(FILTERED_TEXT_HIGHLIGHT_NAME, new Highlight(...ranges));
+    }
+  };
+  function createDomRange(characters, sourceRange) {
+    if (characters.length === 0 || sourceRange.end <= sourceRange.start) {
+      return null;
+    }
+    const startIndex = Math.min(
+      characters.length - 1,
+      Math.max(0, Math.trunc(sourceRange.start))
+    );
+    const endIndex = Math.min(
+      characters.length - 1,
+      Math.max(startIndex, Math.trunc(sourceRange.end) - 1)
+    );
+    const start = characters[startIndex];
+    const end = characters[endIndex];
+    if (!start || !end) {
+      return null;
+    }
+    const range = new Range();
+    range.setStart(start.node, start.startOffset);
+    range.setEnd(end.node, end.endOffset);
+    return range;
+  }
+  function getHighlightRegistry() {
+    if (!("highlights" in CSS)) {
+      return null;
+    }
+    const registry = CSS.highlights;
+    return typeof registry.set === "function" && typeof registry.delete === "function" ? registry : null;
+  }
+
+  // src/content/floating-control-bar.ts
+  var COMPACT_STATE_STORAGE_PREFIX = "floatingControlBarCompact:";
+  var FloatingControlBar = class {
+    host;
+    launcherHost;
+    controlBarElement;
+    playButton;
+    previousButton;
+    nextButton;
+    collapseButton;
+    inputPanel;
+    textInput;
+    inputMessage;
+    siteToolPanel;
+    settingsOverlayHost;
+    compactStateStorageKey;
+    siteToolActionVisibility = [];
+    hasPageItems = false;
+    isLoading = false;
+    mode = "expanded";
+    modeRevision = 0;
+    compactStateWriteQueue = Promise.resolve();
+    isGloballyEnabled = true;
+    horizontalPositionRatio = null;
+    verticalPositionRatio = null;
+    constructor(actions, siteTools = null, startExpanded = false) {
+      this.mode = startExpanded ? "expanded" : "collapsed";
+      this.compactStateStorageKey = `${COMPACT_STATE_STORAGE_PREFIX}${window.location.hostname.toLowerCase()}`;
+      this.host = document.createElement("div");
+      this.host.id = "chrome-tts-floating-control-bar";
+      const shadowRoot = this.host.attachShadow({ mode: "closed" });
+      shadowRoot.append(this.createStyles());
+      this.launcherHost = this.createLauncher();
+      this.controlBarElement = document.createElement("div");
+      this.controlBarElement.className = "control-bar";
+      this.controlBarElement.setAttribute("role", "toolbar");
+      this.controlBarElement.setAttribute("aria-label", "Chrome TTS \u5FEB\u6377\u63A7\u5236\u680F");
+      this.previousButton = this.createButton("previous", "\u64AD\u653E\u4E0A\u4E00\u6761");
+      this.playButton = this.createButton("play", "\u64AD\u653E\u9875\u9762\u6587\u672C");
+      this.nextButton = this.createButton("next", "\u64AD\u653E\u4E0B\u4E00\u6761");
+      const selectionButton = this.createButton("selection", "\u64AD\u653E\u9009\u4E2D\u6587\u672C");
+      const textButton = this.createButton("text", "\u8F93\u5165\u6587\u672C\u5E76\u64AD\u653E");
+      const settingsButton = this.createButton("settings", "\u6253\u5F00\u8BBE\u7F6E");
+      this.collapseButton = this.createButton("compact", "\u5207\u6362\u4E3A\u7B80\u6D01\u63A7\u5236\u680F");
+      const dragButton = this.createButton("drag", "\u62D6\u52A8\u5FEB\u6377\u63A7\u5236\u680F");
+      dragButton.classList.add("drag-button");
+      selectionButton.classList.add("expanded-only");
+      textButton.classList.add("expanded-only");
+      settingsButton.classList.add("expanded-only");
+      dragButton.classList.add("expanded-only");
+      this.playButton.addEventListener("click", actions.onTogglePlayback);
+      this.previousButton.addEventListener("click", actions.onPrevious);
+      this.nextButton.addEventListener("click", actions.onNext);
+      selectionButton.addEventListener("click", actions.onPlaySelection);
+      textButton.addEventListener("click", () => this.toggleInputPanel());
+      settingsButton.addEventListener("click", () => this.openSettingsPanel());
+      this.collapseButton.addEventListener("click", () => this.advanceCollapseMode());
+      this.initializeDragging(dragButton);
+      if (siteTools !== null) {
+        const siteToolsButton = this.createButton("site-tools", siteTools.title);
+        siteToolsButton.addEventListener("click", () => this.toggleSiteToolPanel());
+        this.controlBarElement.append(siteToolsButton);
+      }
+      this.controlBarElement.append(
+        this.previousButton,
+        this.playButton,
+        this.nextButton,
+        selectionButton,
+        textButton,
+        settingsButton,
+        this.collapseButton,
+        dragButton
+      );
+      this.inputPanel = document.createElement("div");
+      this.inputPanel.className = "input-panel";
+      this.inputPanel.hidden = true;
+      this.textInput = document.createElement("textarea");
+      this.textInput.placeholder = "\u8F93\u5165\u9700\u8981\u6717\u8BFB\u7684\u6587\u672C";
+      this.textInput.maxLength = 32768;
+      this.textInput.setAttribute("aria-label", "\u9700\u8981\u6717\u8BFB\u7684\u6587\u672C");
+      const actionRow = document.createElement("div");
+      actionRow.className = "input-actions";
+      const pasteButton = document.createElement("button");
+      pasteButton.type = "button";
+      pasteButton.className = "paste-button";
+      pasteButton.textContent = "\u7C98\u8D34";
+      pasteButton.title = "\u4ECE\u526A\u8D34\u677F\u7C98\u8D34\u6587\u672C";
+      pasteButton.setAttribute("aria-label", "\u4ECE\u526A\u8D34\u677F\u7C98\u8D34\u6587\u672C");
+      pasteButton.addEventListener("click", () => {
+        void this.pasteClipboardText();
+      });
+      const submitButton = document.createElement("button");
+      submitButton.type = "button";
+      submitButton.className = "submit-button";
+      submitButton.textContent = "\u64AD\u653E";
+      submitButton.addEventListener("click", () => {
+        const text = this.textInput.value.trim();
+        if (!text) {
+          this.showInputMessage("\u8BF7\u8F93\u5165\u6587\u672C\u3002");
+          return;
+        }
+        this.showInputMessage("");
+        this.inputPanel.hidden = true;
+        actions.onPlayText(text);
+      });
+      actionRow.append(pasteButton, submitButton);
+      this.inputMessage = document.createElement("div");
+      this.inputMessage.className = "input-message";
+      this.inputMessage.setAttribute("role", "status");
+      this.inputPanel.append(this.textInput, actionRow, this.inputMessage);
+      this.siteToolPanel = document.createElement("div");
+      this.siteToolPanel.className = "site-tool-panel";
+      this.siteToolPanel.hidden = true;
+      if (siteTools !== null) {
+        this.siteToolPanel.setAttribute("aria-label", siteTools.title);
+        for (const action of siteTools.actions) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "site-tool-action";
+          button.textContent = action.label;
+          button.title = action.description;
+          if (action.isAvailable) {
+            this.siteToolActionVisibility.push({
+              button,
+              isAvailable: action.isAvailable
+            });
+            button.hidden = !action.isAvailable();
+          }
+          button.addEventListener("click", () => {
+            this.siteToolPanel.hidden = true;
+            action.activate();
+          });
+          this.siteToolPanel.append(button);
+        }
+      }
+      this.settingsOverlayHost = this.createSettingsOverlay();
+      shadowRoot.append(
+        this.controlBarElement,
+        this.inputPanel,
+        this.siteToolPanel
+      );
+      document.documentElement.append(this.host);
+      document.documentElement.append(this.launcherHost);
+      document.documentElement.append(this.settingsOverlayHost);
+      this.renderVisibility();
+      void this.restoreCompactState();
+      const handleViewportResize = () => {
+        window.requestAnimationFrame(() => {
+          this.constrainToViewport();
+          this.constrainLauncherToViewport();
+          this.constrainInputPanelToViewport();
+        });
+      };
+      window.addEventListener("resize", handleViewportResize);
+      window.visualViewport?.addEventListener("resize", handleViewportResize);
+      window.visualViewport?.addEventListener("scroll", handleViewportResize);
+      document.addEventListener(
+        "pointerdown",
+        (event) => {
+          if (!event.composedPath().includes(this.host)) {
+            this.closeAllPanels();
+          }
+        },
+        true
+      );
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          this.closeAllPanels();
+        }
+      }, true);
+    }
+    /** 根据播放器状态更新主按钮的图标、说明和可用性。 */
+    renderState(state) {
+      this.isLoading = state.status === "loading";
+      this.playButton.disabled = this.isLoading || !this.hasPageItems;
+      if (state.status === "loading") {
+        this.setPlayButton("loading", "\u6B63\u5728\u51C6\u5907\u64AD\u653E");
+      } else if (state.status === "playing") {
+        this.setPlayButton("pause", "\u6682\u505C\u64AD\u653E");
+      } else if (state.status === "paused") {
+        this.setPlayButton("play", "\u6062\u590D\u64AD\u653E");
+      } else {
+        this.setPlayButton("play", "\u64AD\u653E\u9875\u9762\u6587\u672C");
+      }
+    }
+    /** 根据页面队列位置控制上一条/下一条按钮的边界可用性。 */
+    renderNavigation(currentIndex, total) {
+      this.hasPageItems = total > 0;
+      this.previousButton.disabled = total === 0 || currentIndex <= 0;
+      this.nextButton.disabled = total === 0 || currentIndex >= total - 1;
+      this.playButton.disabled = !this.hasPageItems || this.isLoading;
+    }
+    /** 全局关闭时同时隐藏完整控制栏和收起后的启动图标。 */
+    setGlobalEnabled(enabled) {
+      this.isGloballyEnabled = enabled;
+      this.renderVisibility();
+      if (!enabled) {
+        this.closeAllPanels();
+      }
+    }
+    /** 在输入层中显示临时提示，第三阶段统一替换为网页顶部错误 toast。 */
+    showInputMessage(message) {
+      this.inputMessage.textContent = message;
+    }
+    /** 创建统一尺寸的图标按钮，title 与 aria-label 同时提供可访问说明。 */
+    createButton(icon, description) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "control-button";
+      button.append(this.createIcon(icon));
+      button.title = description;
+      button.setAttribute("aria-label", description);
+      return button;
+    }
+    /**
+     * 使用 Pointer Events 实现鼠标和触控拖动。
+     * setPointerCapture 可在指针移出按钮后继续接收移动事件，松开时再释放捕获。
+     */
+    initializeDragging(dragButton) {
+      dragButton.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) {
+          return;
+        }
+        event.preventDefault();
+        const initialRect = this.controlBarElement.getBoundingClientRect();
+        const pointerOffsetX = event.clientX - initialRect.left;
+        const pointerOffsetY = event.clientY - initialRect.top;
+        this.constrainToViewport(initialRect.left, initialRect.top);
+        dragButton.classList.add("is-dragging");
+        dragButton.setPointerCapture(event.pointerId);
+        const handlePointerMove = (moveEvent) => {
+          this.constrainToViewport(
+            moveEvent.clientX - pointerOffsetX,
+            moveEvent.clientY - pointerOffsetY
+          );
+        };
+        const finishDragging = (finishEvent) => {
+          dragButton.classList.remove("is-dragging");
+          dragButton.removeEventListener("pointermove", handlePointerMove);
+          dragButton.removeEventListener("pointerup", finishDragging);
+          dragButton.removeEventListener("pointercancel", finishDragging);
+          if (dragButton.hasPointerCapture(finishEvent.pointerId)) {
+            dragButton.releasePointerCapture(finishEvent.pointerId);
+          }
+        };
+        dragButton.addEventListener("pointermove", handlePointerMove);
+        dragButton.addEventListener("pointerup", finishDragging);
+        dragButton.addEventListener("pointercancel", finishDragging);
+      });
+    }
+    /**
+     * 把请求位置限制在当前可视区域内。
+     * 未提供坐标时使用元素现有位置，因此同一方法也可处理窗口缩放后的自动回收。
+     */
+    constrainToViewport(requestedLeft, requestedTop) {
+      if (this.host.hidden || this.mode === "collapsed") {
+        return;
+      }
+      const currentRect = this.controlBarElement.getBoundingClientRect();
+      const safeMargin = 16;
+      const visualViewport = window.visualViewport;
+      const viewportWidth = Math.min(
+        document.documentElement.clientWidth,
+        visualViewport?.width ?? window.innerWidth
+      );
+      const viewportHeight = Math.min(
+        document.documentElement.clientHeight,
+        visualViewport?.height ?? window.innerHeight
+      );
+      const maximumLeft = Math.max(
+        safeMargin,
+        viewportWidth - currentRect.width - safeMargin
+      );
+      const maximumTop = Math.max(
+        safeMargin,
+        viewportHeight - currentRect.height - safeMargin
+      );
+      const availableHorizontalSpace = maximumLeft - safeMargin;
+      const availableVerticalSpace = maximumTop - safeMargin;
+      const isExplicitMove = requestedLeft !== void 0 || requestedTop !== void 0;
+      const candidateLeft = requestedLeft ?? (this.horizontalPositionRatio === null ? currentRect.left : safeMargin + availableHorizontalSpace * this.horizontalPositionRatio);
+      const candidateTop = requestedTop ?? (this.verticalPositionRatio === null ? currentRect.top : safeMargin + availableVerticalSpace * this.verticalPositionRatio);
+      const left = Math.min(maximumLeft, Math.max(safeMargin, candidateLeft));
+      const top = Math.min(maximumTop, Math.max(safeMargin, candidateTop));
+      if (isExplicitMove || this.horizontalPositionRatio === null) {
+        this.horizontalPositionRatio = availableHorizontalSpace > 0 ? (left - safeMargin) / availableHorizontalSpace : 0;
+      }
+      if (isExplicitMove || this.verticalPositionRatio === null) {
+        this.verticalPositionRatio = availableVerticalSpace > 0 ? (top - safeMargin) / availableVerticalSpace : 0;
+      }
+      this.host.style.right = "auto";
+      this.host.style.transform = "none";
+      this.host.style.left = `${left}px`;
+      this.host.style.top = `${top}px`;
+    }
+    /** 展开或关闭文本输入层，并在展开后把键盘焦点移到文本框。 */
+    toggleInputPanel() {
+      this.siteToolPanel.hidden = true;
+      this.inputPanel.hidden = !this.inputPanel.hidden;
+      this.showInputMessage("");
+      if (!this.inputPanel.hidden) {
+        this.constrainInputPanelToViewport();
+        this.textInput.focus();
+        window.requestAnimationFrame(() => this.constrainInputPanelToViewport());
+      }
+    }
+    /**
+     * 根据移动端实际可视窗口限制文本输入层尺寸和位置。
+     * visualViewport 能反映地址栏、屏幕方向及软键盘占用后的区域；通过 transform 校正
+     * 绝对定位弹层，不改变浮动条自身位置和用户保存的拖动比例。
+     */
+    constrainInputPanelToViewport() {
+      if (this.inputPanel.hidden) {
+        return;
+      }
+      const viewport = window.visualViewport;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const viewportWidth = viewport?.width ?? document.documentElement.clientWidth;
+      const viewportHeight = viewport?.height ?? document.documentElement.clientHeight;
+      const safeMargin = 12;
+      this.inputPanel.style.width = `${Math.min(336, Math.max(160, viewportWidth - safeMargin * 2))}px`;
+      this.textInput.style.height = `${Math.min(220, Math.max(96, viewportHeight - 120))}px`;
+      this.inputPanel.style.transform = "none";
+      const rect = this.inputPanel.getBoundingClientRect();
+      const minimumLeft = viewportLeft + safeMargin;
+      const maximumRight = viewportLeft + viewportWidth - safeMargin;
+      const minimumTop = viewportTop + safeMargin;
+      const maximumBottom = viewportTop + viewportHeight - safeMargin;
+      let translateX = 0;
+      let translateY = 0;
+      if (rect.left < minimumLeft) {
+        translateX = minimumLeft - rect.left;
+      } else if (rect.right > maximumRight) {
+        translateX = maximumRight - rect.right;
+      }
+      if (rect.top < minimumTop) {
+        translateY = minimumTop - rect.top;
+      } else if (rect.bottom > maximumBottom) {
+        translateY = maximumBottom - rect.bottom;
+      }
+      this.inputPanel.style.transform = `translate(${translateX}px, ${translateY}px)`;
+    }
+    /** 切换当前网站提供的工具面板，并关闭其他互斥弹层。 */
+    toggleSiteToolPanel() {
+      this.inputPanel.hidden = true;
+      for (const action of this.siteToolActionVisibility) {
+        action.button.hidden = !action.isAvailable();
+      }
+      this.siteToolPanel.hidden = !this.siteToolPanel.hidden;
+    }
+    /** 关闭浮动条内所有弹层以及独立设置遮罩。 */
+    closeAllPanels() {
+      this.inputPanel.hidden = true;
+      this.siteToolPanel.hidden = true;
+      this.settingsOverlayHost.hidden = true;
+    }
+    /** 在网页上方打开通用设置页，绕过 Edge Android 不可用的 action.openPopup。 */
+    openSettingsPanel() {
+      this.inputPanel.hidden = true;
+      this.siteToolPanel.hidden = true;
+      this.settingsOverlayHost.hidden = false;
+    }
+    /**
+     * 用独立 Shadow DOM 承载设置页，避免网页样式污染，同时让桌面 popup 与移动端
+     * 浮动面板复用同一个 settings.html 和 settings.ts。
+     */
+    createSettingsOverlay() {
+      const overlayHost = document.createElement("div");
+      overlayHost.id = "chrome-tts-settings-overlay";
+      overlayHost.hidden = true;
+      const shadowRoot = overlayHost.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        all: initial;
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: grid;
+        place-items: center;
+        padding: 16px;
+        box-sizing: border-box;
+        background: rgb(0 0 0 / 35%);
+        color-scheme: light;
+      }
+
+      :host([hidden]) {
+        display: none;
+      }
+
+      .dialog {
+        position: relative;
+        width: min(380px, calc(100vw - 32px));
+        height: min(620px, calc(100vh - 32px));
+        overflow: hidden;
+        border: 1px solid rgb(0 0 0 / 15%);
+        border-radius: 14px;
+        background: #fff;
+        box-shadow: 0 12px 38px rgb(0 0 0 / 28%);
+      }
+
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #fff;
+      }
+
+      button {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1;
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        border: 0;
+        border-radius: 8px;
+        color: #3c4043;
+        background: #f1f3f4;
+        cursor: pointer;
+        font: 22px/1 sans-serif;
+      }
+
+      button:focus-visible {
+        outline: 2px solid #1a73e8;
+        outline-offset: 2px;
+      }
+    `;
+      const dialog = document.createElement("div");
+      dialog.className = "dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-label", "Chrome TTS \u8BBE\u7F6E");
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.textContent = "\xD7";
+      closeButton.title = "\u5173\u95ED\u8BBE\u7F6E";
+      closeButton.setAttribute("aria-label", "\u5173\u95ED\u8BBE\u7F6E");
+      closeButton.addEventListener("click", () => {
+        overlayHost.hidden = true;
+      });
+      const frame = document.createElement("iframe");
+      frame.src = chrome.runtime.getURL("settings.html?embedded=1");
+      frame.title = "Chrome TTS \u8BBE\u7F6E";
+      dialog.append(closeButton, frame);
+      shadowRoot.append(style, dialog);
+      overlayHost.addEventListener("pointerdown", (event) => {
+        if (event.composedPath().includes(dialog)) {
+          return;
+        }
+        overlayHost.hidden = true;
+      });
+      return overlayHost;
+    }
+    /**
+     * 在用户点击后读取系统剪贴板并覆盖文本框内容。
+     * clipboardRead 权限只用于这次显式操作；读取失败时保留原文本并显示原因。
+     */
+    async pasteClipboardText() {
+      try {
+        const clipboardText = await navigator.clipboard.readText();
+        if (!clipboardText) {
+          this.showInputMessage("\u526A\u8D34\u677F\u4E2D\u6CA1\u6709\u6587\u672C\u3002");
+          return;
+        }
+        this.textInput.value = clipboardText.slice(0, this.textInput.maxLength);
+        this.showInputMessage("");
+        this.textInput.focus();
+        this.textInput.setSelectionRange(
+          this.textInput.value.length,
+          this.textInput.value.length
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.showInputMessage(`\u8BFB\u53D6\u526A\u8D34\u677F\u5931\u8D25\uFF1A${message}`);
+      }
+    }
+    /** 同步主按钮的可见符号与辅助说明。 */
+    setPlayButton(icon, description) {
+      this.playButton.replaceChildren(this.createIcon(icon));
+      this.playButton.title = description;
+      this.playButton.setAttribute("aria-label", description);
+    }
+    /** 创建统一为 20×20 的内联 SVG，避免字体和系统 emoji 导致图标大小不一致。 */
+    createIcon(icon) {
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("width", "20");
+      svg.setAttribute("height", "20");
+      svg.setAttribute("aria-hidden", "true");
+      svg.setAttribute("focusable", "false");
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", "2");
+      svg.setAttribute("stroke-linecap", "round");
+      svg.setAttribute("stroke-linejoin", "round");
+      const appendShape = (tagName, attributes) => {
+        const shape = document.createElementNS("http://www.w3.org/2000/svg", tagName);
+        for (const [name, value] of Object.entries(attributes)) {
+          shape.setAttribute(name, value);
+        }
+        svg.append(shape);
+      };
+      switch (icon) {
+        case "previous":
+          appendShape("path", { d: "M18 5 8 12l10 7z", fill: "currentColor", stroke: "none" });
+          appendShape("path", { d: "M6 5v14" });
+          break;
+        case "play":
+          appendShape("path", { d: "M8 5v14l11-7z", fill: "currentColor", stroke: "none" });
+          break;
+        case "pause":
+          appendShape("rect", { x: "6", y: "5", width: "4", height: "14", rx: "1", fill: "currentColor", stroke: "none" });
+          appendShape("rect", { x: "14", y: "5", width: "4", height: "14", rx: "1", fill: "currentColor", stroke: "none" });
+          break;
+        case "next":
+          appendShape("path", { d: "m6 5 10 7-10 7z", fill: "currentColor", stroke: "none" });
+          appendShape("path", { d: "M18 5v14" });
+          break;
+        case "loading":
+          svg.classList.add("loading-icon");
+          appendShape("circle", { cx: "12", cy: "12", r: "8", "stroke-dasharray": "32 18" });
+          break;
+        case "selection":
+          appendShape("path", { d: "M4 6h12M4 10h10M4 14h7" });
+          appendShape("path", { d: "m14 13 6 3-3 1-1 3z", fill: "currentColor" });
+          break;
+        case "text":
+          appendShape("rect", { x: "5", y: "3", width: "14", height: "18", rx: "2" });
+          appendShape("path", { d: "M8 8h8M8 12h8M8 16h5" });
+          break;
+        case "settings":
+          appendShape("path", {
+            d: "M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.07-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94L14.38 2.8a.49.49 0 0 0-.49-.4h-3.84a.49.49 0 0 0-.49.4L9.2 5.34c-.58.24-1.12.55-1.62.94L5.19 5.32a.49.49 0 0 0-.61.22L2.66 8.86a.49.49 0 0 0 .12.64l2.03 1.58c-.05.31-.08.64-.08.96s.03.63.08.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.23.4.32.61.22l2.39-.96c.5.39 1.04.71 1.62.94l.36 2.54c.04.24.24.4.49.4h3.84c.25 0 .45-.16.49-.4l.36-2.54c.58-.24 1.12-.55 1.62-.94l2.39.96c.23.08.49 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64zM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5z",
+            fill: "currentColor",
+            stroke: "none"
+          });
+          break;
+        case "site-tools":
+          appendShape("rect", { x: "4", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "14", y: "4", width: "6", height: "6", rx: "1" });
+          appendShape("rect", { x: "4", y: "14", width: "6", height: "6", rx: "1" });
+          appendShape("path", { d: "M14 17h6M17 14v6" });
+          break;
+        case "drag":
+          for (const x of [9, 15]) {
+            for (const y of [6, 12, 18]) {
+              appendShape("circle", { cx: String(x), cy: String(y), r: "1.4", fill: "currentColor", stroke: "none" });
+            }
+          }
+          break;
+        case "compact":
+          appendShape("path", { d: "M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6" });
+          break;
+        case "collapse":
+          appendShape("path", { d: "m9 5 7 7-7 7" });
+          break;
+      }
+      return svg;
+    }
+    /**
+     * 样式只注入闭合 ShadowRoot，不会改变目标网站元素。
+     * z-index 使用较高固定值，确保控制栏不会被普通页面内容遮挡。
+     */
+    createStyles() {
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        all: initial;
+        display: block;
+        position: fixed;
+        top: 50%;
+        right: 16px;
+        z-index: 2147483647;
+        transform: translateY(-50%);
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      :host([hidden]) {
+        display: none;
+      }
+
+      .control-bar {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 7px;
+        border: 1px solid rgb(0 0 0 / 12%);
+        border-radius: 12px;
+        background: rgb(255 255 255 / 96%);
+        box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
+      }
+
+      .control-bar.is-compact .expanded-only {
+        display: none;
+      }
+
+      .control-button,
+      .submit-button,
+      .paste-button {
+        box-sizing: border-box;
+        border: 0;
+        border-radius: 8px;
+        color: #202124;
+        background: #f1f3f4;
+        cursor: pointer;
+        font: 600 14px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .control-button {
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        padding: 0;
+      }
+
+      .control-button:hover,
+      .submit-button:hover,
+      .paste-button:hover {
+        background: #e3e7ea;
+      }
+
+      .control-button:focus-visible,
+      .submit-button:focus-visible,
+      .paste-button:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid #1a73e8;
+        outline-offset: 2px;
+      }
+
+      .control-button:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+
+      .control-button svg {
+        display: block;
+        width: 20px;
+        height: 20px;
+        pointer-events: none;
+      }
+
+      .loading-icon {
+        animation: chrome-tts-spin 0.8s linear infinite;
+      }
+
+      .drag-button {
+        cursor: grab;
+        touch-action: none;
+      }
+
+      .drag-button.is-dragging {
+        cursor: grabbing;
+        background: #dbe7f8;
+      }
+
+      @keyframes chrome-tts-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .input-panel {
+        position: absolute;
+        top: 86px;
+        right: 54px;
+        box-sizing: border-box;
+        width: min(336px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px);
+        overflow: auto;
+        padding: 10px;
+        border: 1px solid rgb(0 0 0 / 12%);
+        border-radius: 10px;
+        background: #fff;
+        box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
+      }
+
+      .input-panel[hidden] {
+        display: none;
+      }
+
+      .site-tool-panel {
+        position: absolute;
+        top: 0;
+        right: 54px;
+        display: grid;
+        gap: 7px;
+        box-sizing: border-box;
+        width: 180px;
+        padding: 10px;
+        border: 1px solid rgb(0 0 0 / 12%);
+        border-radius: 10px;
+        background: #fff;
+        box-shadow: 0 5px 20px rgb(0 0 0 / 18%);
+      }
+
+      .site-tool-panel[hidden] {
+        display: none;
+      }
+
+      .site-tool-action {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 36px;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 7px;
+        color: #202124;
+        background: #f1f3f4;
+        cursor: pointer;
+        font: 600 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: center;
+        white-space: nowrap;
+      }
+
+      .site-tool-action:hover {
+        background: #e3e7ea;
+      }
+
+      textarea {
+        box-sizing: border-box;
+        width: 100%;
+        height: 220px;
+        margin: 0 0 8px;
+        padding: 8px;
+        resize: vertical;
+        border: 1px solid #c7cacf;
+        border-radius: 7px;
+        color: #202124;
+        background: #fff;
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        overflow-y: auto;
+        scrollbar-color: transparent transparent;
+        scrollbar-width: thin;
+      }
+
+      textarea:hover,
+      textarea:focus {
+        scrollbar-color: rgb(95 99 104 / 60%) transparent;
+      }
+
+      textarea::-webkit-scrollbar {
+        width: 8px;
+      }
+
+      textarea::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      textarea::-webkit-scrollbar-thumb {
+        border: 2px solid transparent;
+        border-radius: 999px;
+        background: transparent;
+        background-clip: padding-box;
+      }
+
+      textarea:hover::-webkit-scrollbar-thumb,
+      textarea:focus::-webkit-scrollbar-thumb {
+        background: rgb(95 99 104 / 60%);
+        background-clip: padding-box;
+      }
+
+      .input-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .submit-button {
+        flex: 1;
+        padding: 9px;
+        color: #fff;
+        background: #1a73e8;
+      }
+
+      .paste-button {
+        flex: 0 0 72px;
+        padding: 9px;
+      }
+
+      .submit-button:hover {
+        background: #1765cc;
+      }
+
+      .input-message {
+        margin-top: 6px;
+        color: #b3261e;
+        font-size: 12px;
+        line-height: 16px;
+      }
+
+      .input-message:empty {
+        display: none;
+      }
+    `;
+      return style;
+    }
+    /** 启动图标使用独立 fixed 宿主，始终固定在窗口右上角且不继承浮动条拖动位置。 */
+    createLauncher() {
+      const host = document.createElement("div");
+      host.id = "chrome-tts-collapsed-launcher";
+      host.hidden = true;
+      const shadow = host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        all: initial;
+        position: fixed;
+        right: max(16px, env(safe-area-inset-right));
+        top: max(16px, env(safe-area-inset-top));
+        z-index: 2147483647;
+        display: block;
+        color-scheme: light;
+      }
+      :host([hidden]) {
+        display: none;
+      }
+      button {
+        display: grid;
+        place-items: center;
+        box-sizing: border-box;
+        width: 46px;
+        height: 46px;
+        padding: 7px;
+        border: 1px solid rgb(0 0 0 / 14%);
+        border-radius: 14px;
+        background: rgb(255 255 255 / 96%);
+        box-shadow: 0 5px 20px rgb(0 0 0 / 22%);
+        cursor: pointer;
+      }
+      button:hover {
+        background: #f1f3f4;
+      }
+      button:focus-visible {
+        outline: 3px solid rgb(26 115 232 / 35%);
+        outline-offset: 2px;
+      }
+      img {
+        display: block;
+        width: 32px;
+        height: 32px;
+        object-fit: contain;
+      }
+    `;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.title = "\u5C55\u5F00 Chrome TTS \u5FEB\u6377\u63A7\u5236\u680F";
+      button.setAttribute("aria-label", "\u5C55\u5F00 Chrome TTS \u5FEB\u6377\u63A7\u5236\u680F");
+      const icon = document.createElement("img");
+      icon.src = chrome.runtime.getURL("assets/icons/icon-48.png");
+      icon.alt = "";
+      icon.setAttribute("aria-hidden", "true");
+      button.append(icon);
+      button.addEventListener("click", () => this.expand());
+      shadow.append(style, button);
+      return host;
+    }
+    /**
+     * 完整控制栏第一次点击进入简洁态，第二次点击才完全隐藏。
+     * 每次改变尺寸前记录相对位置，改变后再按新尺寸约束，避免靠近底部或右侧时越界。
+     */
+    advanceCollapseMode() {
+      this.modeRevision += 1;
+      const currentRect = this.controlBarElement.getBoundingClientRect();
+      this.constrainToViewport(currentRect.left, currentRect.top);
+      this.closeAllPanels();
+      if (this.mode === "expanded") {
+        this.mode = "compact";
+        this.queueCompactStateWrite(true);
+        this.renderVisibility();
+        window.requestAnimationFrame(() => this.constrainToViewport());
+        return;
+      }
+      this.mode = "collapsed";
+      this.queueCompactStateWrite(false);
+      this.renderVisibility();
+    }
+    expand() {
+      this.modeRevision += 1;
+      this.mode = "expanded";
+      this.queueCompactStateWrite(false);
+      this.renderVisibility();
+      window.requestAnimationFrame(() => this.constrainToViewport());
+    }
+    /**
+     * 页面初始化时只识别值为 true 的简洁态标记。读取完成前若用户已操作浮动条，
+     * 通过 revision 放弃旧读取结果，防止异步恢复覆盖用户刚刚选择的新状态。
+     */
+    async restoreCompactState() {
+      const revisionAtStart = this.modeRevision;
+      try {
+        const stored = await chrome.storage.local.get(this.compactStateStorageKey);
+        if (this.modeRevision !== revisionAtStart || stored[this.compactStateStorageKey] !== true) {
+          return;
+        }
+        this.mode = "compact";
+        this.renderVisibility();
+        window.requestAnimationFrame(() => this.constrainToViewport());
+      } catch {
+      }
+    }
+    /**
+     * 只有简洁态写入 true；完整态和隐藏态删除键，因此 storage 中不存在其他状态。
+     * 写操作串行执行，保证快速连续点击后最后一次状态不会被较早的异步写入覆盖。
+     */
+    queueCompactStateWrite(isCompact) {
+      this.compactStateWriteQueue = this.compactStateWriteQueue.then(async () => {
+        if (isCompact) {
+          await chrome.storage.local.set({ [this.compactStateStorageKey]: true });
+        } else {
+          await chrome.storage.local.remove(this.compactStateStorageKey);
+        }
+      }).catch(() => {
+      });
+    }
+    /**
+     * 启动图标以 CSS 固定在右上角；额外根据 visualViewport 校正缩放和平移后的可见区域。
+     * 这能覆盖移动端地址栏变化、窗口缩放和页面放大后布局视口与可视视口不一致的情况。
+     */
+    constrainLauncherToViewport() {
+      if (this.launcherHost.hidden) {
+        return;
+      }
+      this.launcherHost.style.transform = "none";
+      const rect = this.launcherHost.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const viewportWidth = viewport?.width ?? document.documentElement.clientWidth;
+      const safeMargin = 16;
+      const desiredLeft = viewportLeft + viewportWidth - rect.width - safeMargin;
+      const desiredTop = viewportTop + safeMargin;
+      this.launcherHost.style.transform = `translate(${desiredLeft - rect.left}px, ${desiredTop - rect.top}px)`;
+    }
+    /** 同步三种显示状态，并为两级收起动作设置不同图标和辅助说明。 */
+    renderVisibility() {
+      const isCollapsed = this.mode === "collapsed";
+      this.host.hidden = !this.isGloballyEnabled || isCollapsed;
+      this.launcherHost.hidden = !this.isGloballyEnabled || !isCollapsed;
+      this.controlBarElement.classList.toggle("is-compact", this.mode === "compact");
+      const collapseIcon = this.mode === "compact" ? "collapse" : "compact";
+      const collapseDescription = this.mode === "compact" ? "\u9690\u85CF\u5FEB\u6377\u63A7\u5236\u680F" : "\u5207\u6362\u4E3A\u7B80\u6D01\u63A7\u5236\u680F";
+      this.collapseButton.replaceChildren(this.createIcon(collapseIcon));
+      this.collapseButton.title = collapseDescription;
+      this.collapseButton.setAttribute("aria-label", collapseDescription);
+      if (!this.launcherHost.hidden) {
+        window.requestAnimationFrame(() => this.constrainLauncherToViewport());
+      }
+    }
+  };
+
+  // src/content/page-highlighter.ts
+  var CURRENT_CLASS = "chrome-tts-current-text";
+  var STYLE_ID = "chrome-tts-page-highlight-style";
+  var POSITION_HIGHLIGHT_NAME = "chrome-tts-current-position";
+  var POSITION_OVERLAY_ID = "chrome-tts-position-overlay";
+  var TEXT_COLOR_ATTRIBUTE = "data-chrome-tts-highlight-text-color";
+  var TEXT_COLOR_VARIABLE = "--chrome-tts-highlight-text-color";
+  var PageHighlighter = class {
+    constructor(adapter) {
+      this.adapter = adapter;
+      const existingStyle = document.getElementById(STYLE_ID);
+      this.styleElement = existingStyle instanceof HTMLStyleElement ? existingStyle : document.createElement("style");
+      if (!this.styleElement.isConnected) {
+        this.styleElement.id = STYLE_ID;
+        document.documentElement.append(this.styleElement);
+      }
+      this.renderColors("#22a06b", "#e6f6ef");
+      this.positionOverlay = document.createElement("div");
+      this.positionOverlay.id = POSITION_OVERLAY_ID;
+      Object.assign(this.positionOverlay.style, {
+        position: "fixed",
+        inset: "0",
+        zIndex: "2147483645",
+        pointerEvents: "none",
+        overflow: "visible"
+      });
+      document.documentElement.append(this.positionOverlay);
+      window.addEventListener("scroll", () => this.clearPosition(), true);
+      window.addEventListener("resize", () => this.clearPosition());
+    }
+    currentElement = null;
+    currentItemId = null;
+    mappedElement = null;
+    characterMap = [];
+    positionOverlay;
+    styleElement;
+    /** 更新整段高亮配色；颜色已在 storage 归一化，仅写入本扩展专属样式节点。 */
+    renderColors(borderColor, backgroundColor) {
+      this.styleElement.textContent = `
+        .${CURRENT_CLASS} {
+          outline: 3px solid ${borderColor} !important;
+          outline-offset: 4px !important;
+          background: ${backgroundColor} !important;
+          transition: background-color 120ms ease, outline-color 120ms ease !important;
+        }
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}],
+        .${CURRENT_CLASS}[${TEXT_COLOR_ATTRIBUTE}] * {
+          color: var(${TEXT_COLOR_VARIABLE}) !important;
+        }
+        ::highlight(${POSITION_HIGHLIGHT_NAME}) {
+          color: #063c2b;
+          background-color: #6ee7b7;
+          text-decoration: underline 2px #16845b;
+          text-underline-offset: 2px;
+        }
+      `;
+    }
+    /** 切换整段高亮；只有条目真正变化时才滚动，暂停/恢复不会反复移动页面。 */
+    highlight(itemId) {
+      const element = this.adapter.findTextElement(itemId);
+      if (!element) {
+        return;
+      }
+      const itemChanged = itemId !== this.currentItemId || element !== this.currentElement;
+      if (itemChanged) {
+        this.clearPosition();
+        this.removeCurrentElementStyles();
+        element.classList.add(CURRENT_CLASS);
+        this.applyTextColor(element, itemId);
+        element.scrollIntoView({ behavior: "smooth", block: "center" });
+        this.currentElement = element;
+        this.currentItemId = itemId;
+      }
+    }
+    /** 按规范化文本索引高亮当前字或词；使用 Range，不插入 span，不破坏网站框架状态。 */
+    highlightPosition(itemId, charIndex, length) {
+      const rootElement = this.adapter.findTextElement(itemId);
+      const registry = getHighlightRegistry2();
+      if (!rootElement) {
+        return;
+      }
+      const resolvedPosition = this.adapter.resolveTextDomPosition?.(
+        itemId,
+        charIndex
+      );
+      if (this.adapter.resolveTextDomPosition && resolvedPosition === null) {
+        registry?.delete(POSITION_HIGHLIGHT_NAME);
+        this.positionOverlay.replaceChildren();
+        return;
+      }
+      const element = resolvedPosition?.element ?? rootElement;
+      if (element !== this.mappedElement) {
+        this.mappedElement = element;
+        this.characterMap = createNormalizedCharacterMap(element);
+      }
+      const textElementOffset = this.adapter.getTextElementCharOffset?.(itemId) ?? 0;
+      const elementCharIndex = resolvedPosition?.charIndex ?? charIndex - textElementOffset;
+      if (elementCharIndex < 0) {
+        registry?.delete(POSITION_HIGHLIGHT_NAME);
+        this.positionOverlay.replaceChildren();
+        return;
+      }
+      const characters = this.characterMap;
+      const startIndex = Math.min(
+        characters.length - 1,
+        Math.max(0, Math.trunc(elementCharIndex))
+      );
+      if (startIndex < 0) {
+        return;
+      }
+      const endIndex = Math.min(
+        characters.length - 1,
+        startIndex + Math.max(1, Math.trunc(length)) - 1
+      );
+      const start = characters[startIndex];
+      const end = characters[endIndex];
+      if (!start || !end) {
+        return;
+      }
+      const range = new Range();
+      range.setStart(start.node, start.startOffset);
+      range.setEnd(end.node, end.endOffset);
+      registry?.set(POSITION_HIGHLIGHT_NAME, new Highlight(range));
+      this.renderPositionOverlay(range);
+    }
+    /** 清除当前正文高亮，同时忘记 DOM 引用，下一次播放同一条时仍会重新高亮。 */
+    clear() {
+      this.clearPosition();
+      this.removeCurrentElementStyles();
+      this.currentElement = null;
+      this.currentItemId = null;
+      this.mappedElement = null;
+      this.characterMap = [];
+    }
+    clearPosition() {
+      getHighlightRegistry2()?.delete(POSITION_HIGHLIGHT_NAME);
+      this.positionOverlay.replaceChildren();
+    }
+    /**
+     * content script 的 CSS Highlight 注册表在部分页面隔离环境中不会绘制。
+     * 用 Range 的视口矩形生成透明覆盖层作为稳定回退，不包裹或拆分正文文本节点。
+     */
+    renderPositionOverlay(range) {
+      this.positionOverlay.replaceChildren();
+      for (const rect of Array.from(range.getClientRects())) {
+        if (rect.width <= 0 || rect.height <= 0) {
+          continue;
+        }
+        const marker = document.createElement("div");
+        Object.assign(marker.style, {
+          position: "absolute",
+          left: `${rect.left}px`,
+          top: `${rect.top}px`,
+          width: `${rect.width}px`,
+          height: `${rect.height}px`,
+          boxSizing: "border-box",
+          borderBottom: "2px solid #16845b",
+          borderRadius: "3px",
+          background: "rgb(110 231 183 / 52%)",
+          mixBlendMode: "multiply"
+        });
+        this.positionOverlay.append(marker);
+      }
+    }
+    /** DOM 重新扫描后用同一 ID 重新绑定可能已被替换的元素。 */
+    refresh() {
+      this.mappedElement = null;
+      this.characterMap = [];
+      if (!this.currentItemId) {
+        return;
+      }
+      const replacement = this.adapter.findTextElement(this.currentItemId);
+      if (replacement && replacement !== this.currentElement) {
+        this.clearPosition();
+        this.removeCurrentElementStyles();
+        replacement.classList.add(CURRENT_CLASS);
+        this.applyTextColor(replacement, this.currentItemId);
+        this.currentElement = replacement;
+      }
+    }
+    /** 仅当当前适配器明确要求时设置颜色变量，通用页面不产生额外样式覆盖。 */
+    applyTextColor(element, itemId) {
+      const color = this.adapter.getHighlightTextColor?.(itemId) ?? null;
+      if (!color) {
+        return;
+      }
+      element.setAttribute(TEXT_COLOR_ATTRIBUTE, "");
+      element.style.setProperty(TEXT_COLOR_VARIABLE, color);
+    }
+    removeCurrentElementStyles() {
+      this.currentElement?.classList.remove(CURRENT_CLASS);
+      this.currentElement?.removeAttribute(TEXT_COLOR_ATTRIBUTE);
+      this.currentElement?.style.removeProperty(TEXT_COLOR_VARIABLE);
+    }
+  };
+  function getHighlightRegistry2() {
+    if (!("highlights" in CSS)) {
+      return null;
+    }
+    const registry = CSS.highlights;
+    return typeof registry.set === "function" && typeof registry.delete === "function" ? registry : null;
+  }
+
+  // src/content/selection-jump-prompt.ts
+  var SelectionJumpPrompt = class {
+    constructor(onJump) {
+      this.onJump = onJump;
+      this.host = document.createElement("div");
+      this.host.id = "chrome-tts-selection-jump-prompt";
+      this.host.hidden = true;
+      const shadow = this.host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        position: fixed;
+        z-index: 2147483647;
+        display: block;
+      }
+      :host([hidden]) {
+        display: none;
+      }
+      button {
+        min-width: 58px;
+        height: 34px;
+        padding: 0 14px;
+        border: 1px solid rgb(22 132 91 / 45%);
+        border-radius: 17px;
+        color: #fff;
+        background: #16845b;
+        box-shadow: 0 5px 16px rgb(0 0 0 / 22%);
+        font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #116b4a;
+      }
+      button:focus-visible {
+        outline: 3px solid rgb(52 211 153 / 45%);
+        outline-offset: 2px;
+      }
+    `;
+      this.button = document.createElement("button");
+      this.button.type = "button";
+      this.button.textContent = "\u8DF3\u8F6C";
+      this.button.setAttribute("aria-label", "\u4ECE\u9009\u62E9\u4F4D\u7F6E\u5F00\u59CB\u64AD\u653E");
+      this.button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      this.button.addEventListener("click", () => {
+        const position = this.position;
+        this.hide();
+        if (position) {
+          this.onJump(position);
+        }
+      });
+      shadow.append(style, this.button);
+      document.documentElement.append(this.host);
+      document.addEventListener(
+        "pointerdown",
+        (event) => {
+          if (!event.composedPath().includes(this.host)) {
+            this.hide();
+          }
+        },
+        true
+      );
+      window.addEventListener("scroll", () => this.hide(), true);
+      window.addEventListener("resize", () => this.hide());
+    }
+    host;
+    button;
+    position = null;
+    /** 根据选区矩形定位，确保按钮完整留在当前视口内。 */
+    show(rect, position) {
+      this.position = position;
+      this.host.hidden = false;
+      const margin = 8;
+      const width = this.host.offsetWidth;
+      const height = this.host.offsetHeight;
+      const preferredLeft = rect.left + rect.width / 2 - width / 2;
+      const left = Math.min(
+        window.innerWidth - width - margin,
+        Math.max(margin, preferredLeft)
+      );
+      const belowTop = rect.bottom + margin;
+      const top = belowTop + height <= window.innerHeight - margin ? belowTop : Math.max(margin, rect.top - height - margin);
+      this.host.style.left = `${left}px`;
+      this.host.style.top = `${top}px`;
+    }
+    hide() {
+      this.host.hidden = true;
+      this.position = null;
+    }
+  };
+
+  // src/content/site-content-scope.ts
+  function applySiteContentScope(items, adapter, scope) {
+    if (scope === null) {
+      return [...items];
+    }
+    return items.filter((item) => {
+      const element = adapter.findTextElement(item.id);
+      return element !== null && scope.contains(element);
+    });
+  }
+
+  // src/content/sites/end-gfw-content-scope.ts
+  var endGfwContentScope = {
+    id: "end-gfw-print-articles",
+    matches: (url) => url.hostname === "end-gfw.com" && url.pathname === "/tweets" && url.searchParams.get("view") === "print",
+    contains: (element) => element.closest("main article") !== null
+  };
+
+  // src/content/site-content-scope-registry.ts
+  function resolveSiteContentScope(url) {
+    const scopes = [endGfwContentScope];
+    return scopes.find((scope) => scope.matches(url)) ?? null;
+  }
+
+  // src/shared/messages.ts
+  function isEndGfwTweetTime(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)) return false;
+    const iso = value.replace(" ", "T") + ".000Z";
+    const date = new Date(iso);
+    return Number.isFinite(date.getTime()) && date.toISOString() === iso;
+  }
+
+  // src/content/sites/end-gfw-site.ts
+  var END_GFW_TWEET_SELECTOR = "main article";
+  var X_STATUS_LINK_SELECTOR = 'a[href*="/status/"]';
+  var endGfwSiteIntegration = {
+    id: "end-gfw",
+    matches: (url) => url.hostname === "end-gfw.com",
+    create(url, context) {
+      const toolPanel = createTweetPageToolPanel(url, context);
+      return {
+        // 该站点明确要求进入页面时直接展示浮动条。
+        startExpanded: true,
+        ...toolPanel ? { toolPanel } : {}
+      };
+    }
+  };
+  function createTweetPageToolPanel(url, context) {
+    const date = parseEndGfwDate(url);
+    if (url.pathname !== "/tweets" || url.searchParams.get("view") !== "print" || !date) {
+      return null;
+    }
+    return {
+      title: "End GFW \u5DE5\u5177",
+      actions: [
+        {
+          id: "push-tweet",
+          label: "\u63A8\u9001\u81F3Discord",
+          description: "\u5C06\u5F53\u524D\u63A8\u6587\u65F6\u95F4\u3001ID \u548C\u539F\u59CB\u94FE\u63A5\u53D1\u9001\u5230 Discord",
+          activate: () => {
+            void pushCurrentTweet(context).catch((error) => {
+              context.reportError({
+                ...createSiteToolError("PUSH_TWEET_FAILED", error),
+                requiresConfirmation: true
+              });
+            });
+          }
+        },
+        {
+          id: "copy-tweet-id",
+          label: "\u590D\u5236\u63A8\u6587 ID",
+          description: "\u590D\u5236\u5F53\u524D\u64AD\u653E\u6216\u5F53\u524D\u53EF\u89C1\u63A8\u6587\u94FE\u63A5\u4E2D\u7684 ID",
+          activate: () => {
+            void copyCurrentTweetId(context).catch((error) => {
+              context.reportError(createSiteToolError("COPY_TWEET_ID_FAILED", error));
+            });
+          }
+        },
+        {
+          id: "configure-tweet-webhook",
+          label: "\u8BBE\u7F6E Webhook",
+          description: "\u4FDD\u5B58\u63A8\u6587\u63A8\u9001\u7684 Discord Webhook\uFF0C\u7559\u7A7A\u4FDD\u5B58\u53EF\u6E05\u9664",
+          activate: () => {
+            void configureTweetWebhook(context).catch((error) => {
+              context.reportError(createSiteToolError("SAVE_WEBHOOK_FAILED", error));
+            });
+          }
+        },
+        {
+          id: "previous-day",
+          label: "\u4E0A\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0A\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, -1)
+        },
+        {
+          id: "next-day",
+          label: "\u4E0B\u4E00\u5929",
+          description: "\u8DF3\u8F6C\u5230\u4E0B\u4E00\u5929\u7684\u63A8\u6587\u9875\u9762",
+          activate: () => navigateToAdjacentDay(url, date, 1)
+        }
+      ]
+    };
+  }
+  function parseEndGfwDate(url) {
+    const rawDate = url.searchParams.get("date") ?? "";
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(rawDate);
+    if (!match) {
+      return null;
+    }
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month && date.getUTCDate() === day ? { year, month, day } : null;
+  }
+  function navigateToAdjacentDay(currentUrl, currentDate, offset) {
+    const date = new Date(
+      Date.UTC(currentDate.year, currentDate.month - 1, currentDate.day)
+    );
+    date.setUTCDate(date.getUTCDate() + offset);
+    const targetUrl = new URL(currentUrl.href);
+    const nextDate = [
+      String(date.getUTCFullYear()).padStart(4, "0"),
+      String(date.getUTCMonth() + 1).padStart(2, "0"),
+      String(date.getUTCDate()).padStart(2, "0")
+    ].join("-");
+    targetUrl.searchParams.set("date", nextDate);
+    window.location.assign(targetUrl.href);
+  }
+  async function copyCurrentTweetId(context) {
+    await writeClipboardText(getCurrentTweet(context).tweetId);
+  }
+  async function configureTweetWebhook(context) {
+    const current = await sendWebhookRequest({ type: "end-gfw:get-webhook" });
+    const url = window.prompt("\u8BF7\u8F93\u5165\u63A8\u6587\u63A8\u9001\u7684 Discord Webhook\u3002\u7559\u7A7A\u5E76\u786E\u5B9A\u53EF\u6E05\u9664\uFF1B\u53D6\u6D88\u4FDD\u7559\u539F\u914D\u7F6E\u3002", current.webhookUrl ?? "");
+    if (url === null) return;
+    await sendWebhookRequest({ type: "end-gfw:save-webhook", url: url.trim() });
+    context.showNotice(url.trim() ? "Webhook \u5DF2\u4FDD\u5B58\uFF0C\u6D4F\u89C8\u5668\u91CD\u542F\u540E\u4ECD\u6709\u6548\u3002" : "Webhook \u5DF2\u6E05\u9664\u3002");
+  }
+  async function pushCurrentTweet(context) {
+    const tweet = getCurrentTweet(context);
+    if (!tweet.time) throw new Error("\u5F53\u524D\u63A8\u6587\u5361\u7247\u4E2D\u6CA1\u6709\u6709\u6548\u65F6\u95F4\uFF0C\u65E0\u6CD5\u63A8\u9001\u3002");
+    await sendWebhookRequest({ type: "end-gfw:push-tweet", ...tweet, time: tweet.time });
+    context.showNotice(`\u63A8\u9001\u6210\u529F\uFF0CID\uFF1A${tweet.tweetId}`);
+  }
+  async function sendWebhookRequest(request) {
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage(request);
+    } catch {
+      throw new Error("\u65E0\u6CD5\u8FDE\u63A5\u6269\u5C55\u540E\u53F0\uFF0C\u8BF7\u91CD\u65B0\u52A0\u8F7D\u6269\u5C55\u5E76\u5237\u65B0\u9875\u9762\u3002");
+    }
+    if (!response?.ok) throw new Error(response?.error ?? "\u63A8\u6587\u63A8\u9001\u64CD\u4F5C\u5931\u8D25\u3002");
+    return response;
+  }
+  function getCurrentTweet(context) {
+    const currentArticle = context.getCurrentTextElement()?.closest(END_GFW_TWEET_SELECTOR);
+    const article = currentArticle ?? findNearestVisibleTweet();
+    if (!article) {
+      throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u8BC6\u522B\u7684\u63A8\u6587\u3002");
+    }
+    const time = Array.from(article.querySelectorAll(":scope > .item-meta span")).map((element) => element.textContent?.trim() ?? "").find(isEndGfwTweetTime) ?? null;
+    const links = Array.from(
+      article.querySelectorAll(X_STATUS_LINK_SELECTOR)
+    );
+    const primaryLink = links.find(
+      (link) => link.textContent?.replace(/\s+/gu, "") === "\u67E5\u770B\u539F\u6587"
+    );
+    const orderedLinks = primaryLink ? [primaryLink, ...links.filter((link) => link !== primaryLink)] : links;
+    for (const link of orderedLinks) {
+      const tweetId = extractTweetIdFromStatusLink(link);
+      if (tweetId) {
+        return { tweetId, url: link.href, time };
+      }
+    }
+    throw new Error("\u5F53\u524D\u63A8\u6587\u6CA1\u6709\u53EF\u63D0\u53D6 ID \u7684 X \u94FE\u63A5\u3002");
+  }
+  function extractTweetIdFromStatusLink(link) {
+    try {
+      const url = new URL(link.href, window.location.href);
+      const hostname = url.hostname.toLowerCase();
+      if (hostname !== "x.com" && hostname !== "www.x.com") {
+        return null;
+      }
+      return /\/status\/(\d+)(?:\/|$)/u.exec(url.pathname)?.[1] ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function findNearestVisibleTweet() {
+    const viewportCenter = (window.visualViewport?.height ?? window.innerHeight) / 2;
+    let nearestArticle = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    const articles = Array.from(
+      document.querySelectorAll(END_GFW_TWEET_SELECTOR)
+    );
+    for (const article of articles) {
+      const rect = article.getBoundingClientRect();
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) {
+        continue;
+      }
+      const distance = Math.abs(rect.top + rect.height / 2 - viewportCenter);
+      if (distance < nearestDistance) {
+        nearestArticle = article;
+        nearestDistance = distance;
+      }
+    }
+    return nearestArticle;
+  }
+  async function writeClipboardText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.readOnly = true;
+      Object.assign(input.style, {
+        position: "fixed",
+        left: "-10000px",
+        top: "0"
+      });
+      document.documentElement.append(input);
+      input.select();
+      const copied = document.execCommand("copy");
+      input.remove();
+      if (!copied) {
+        throw new Error("\u590D\u5236\u63A8\u6587 ID \u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u6D4F\u89C8\u5668\u526A\u8D34\u677F\u6743\u9650\u3002");
+      }
+    }
+  }
+  function createSiteToolError(code, error) {
+    return {
+      code,
+      message: error instanceof Error ? error.message : String(error),
+      source: "content",
+      recoverable: true
+    };
+  }
+
+  // src/content/sites/reddit-site.ts
+  var REDDIT_POST_PATH_PATTERN = /^\/r\/[^/]+\/comments\/[a-z0-9]+(?:\/|$)/iu;
+  var SIMPLIFIED_CHINESE_LOCALE = "zh-hans";
+  var redditSiteIntegration = {
+    id: "reddit",
+    matches: (url) => isRedditHost(url.hostname) && REDDIT_POST_PATH_PATTERN.test(url.pathname),
+    create() {
+      return {
+        // Reddit 帖子页与 End GFW 一致，首次进入时直接显示完整浮动条。
+        startExpanded: true,
+        toolPanel: createRedditToolPanel()
+      };
+    }
+  };
+  function createRedditToolPanel() {
+    return {
+      title: "Reddit \u5DE5\u5177",
+      actions: [
+        {
+          id: "open-simplified-chinese-translation",
+          label: "\u7B80\u4F53\u4E2D\u6587\u7FFB\u8BD1",
+          description: "\u4F7F\u7528 Reddit \u7684\u7B80\u4F53\u4E2D\u6587\u7FFB\u8BD1\u9875\u9762\u6253\u5F00\u5F53\u524D\u5E16\u5B50",
+          activate: navigateToSimplifiedChineseTranslation
+        }
+      ]
+    };
+  }
+  function navigateToSimplifiedChineseTranslation() {
+    const targetUrl = new URL(window.location.href);
+    if (targetUrl.searchParams.get("tl") === SIMPLIFIED_CHINESE_LOCALE) {
+      return;
+    }
+    targetUrl.searchParams.set("tl", SIMPLIFIED_CHINESE_LOCALE);
+    window.location.assign(targetUrl.href);
+  }
+  function isRedditHost(hostname) {
+    const normalizedHostname = hostname.toLowerCase();
+    return normalizedHostname === "reddit.com" || normalizedHostname.endsWith(".reddit.com");
+  }
+
+  // src/content/sites/youtube-site.ts
+  var CAPTION_SEGMENT_SELECTOR = ".ytp-caption-window-container .ytp-caption-segment";
+  var YOUTUBE_NAVIGATION_START_EVENT = "yt-navigate-start";
+  var youtubeSiteIntegration = {
+    id: "youtube",
+    matches: (url) => isYoutubeHost(url.hostname),
+    create(_url, context) {
+      const reader = new YoutubeCaptionReader(context);
+      return {
+        // YouTube 的单页路由不会重新注入 content script，工具入口需在整个站点保持可用。
+        toolPanel: createToolPanel(reader),
+        start: () => reader.start(),
+        stop: () => reader.stop()
+      };
+    }
+  };
+  function createToolPanel(reader) {
+    return {
+      title: "YouTube \u5B57\u5E55\u5DE5\u5177",
+      actions: [
+        {
+          id: "start-caption-reading",
+          label: "\u5F00\u542F\u5B57\u5E55\u6717\u8BFB",
+          description: "\u6717\u8BFB\u64AD\u653E\u5668\u4E2D\u5F53\u524D\u53CA\u540E\u7EED\u663E\u793A\u7684\u5B57\u5E55",
+          activate: () => reader.enable()
+        },
+        {
+          id: "stop-caption-reading",
+          label: "\u505C\u6B62\u5B57\u5E55\u6717\u8BFB",
+          description: "\u505C\u6B62\u76D1\u542C\u5B57\u5E55\u5E76\u505C\u6B62\u5F53\u524D\u5B57\u5E55\u8BED\u97F3",
+          activate: () => reader.disable()
+        },
+        {
+          id: "select-simplified-chinese-captions",
+          label: "\u5207\u6362\u7B80\u4F53\u4E2D\u6587\u5B57\u5E55",
+          description: "\u81EA\u52A8\u9009\u62E9\u5B57\u5E55\u3001\u81EA\u52A8\u7FFB\u8BD1\u3001\u4E2D\u6587\uFF08\u7B80\u4F53\uFF09",
+          isAvailable: () => reader.hasAvailableCaptions(),
+          activate: () => {
+            void reader.selectSimplifiedChineseCaptions();
+          }
+        }
+      ]
+    };
+  }
+  var YoutubeCaptionReader = class {
+    constructor(context) {
+      this.context = context;
+    }
+    observer = null;
+    captionReadTimer = null;
+    enabled = false;
+    previousCaption = "";
+    pendingCaption = "";
+    captionSpeechActive = false;
+    unsubscribePlaybackState = null;
+    /** 单页导航事件负责重新绑定播放器，避免长期观察整个 YouTube 文档。 */
+    start() {
+      this.unsubscribePlaybackState = this.context.subscribePlaybackState(
+        (state) => this.handlePlaybackState(state)
+      );
+      document.addEventListener(
+        YOUTUBE_NAVIGATION_START_EVENT,
+        this.handleNavigationStart
+      );
+    }
+    stop() {
+      this.disable();
+      this.unsubscribePlaybackState?.();
+      this.unsubscribePlaybackState = null;
+      this.observer?.disconnect();
+      this.observer = null;
+      document.removeEventListener(
+        YOUTUBE_NAVIGATION_START_EVENT,
+        this.handleNavigationStart
+      );
+    }
+    /** 开启时要求播放器已经启用字幕，避免按钮成功但页面实际上没有字幕来源。 */
+    enable() {
+      if (!isWatchPage(new URL(window.location.href))) {
+        this.report("YOUTUBE_NOT_WATCH_PAGE", "\u8BF7\u5148\u6253\u5F00 YouTube \u89C6\u9891\u64AD\u653E\u9875\u3002");
+        return;
+      }
+      if (document.querySelector(CAPTION_SEGMENT_SELECTOR) === null) {
+        this.report(
+          "YOUTUBE_CAPTION_NOT_VISIBLE",
+          "\u6CA1\u6709\u68C0\u6D4B\u5230\u5B57\u5E55\uFF0C\u8BF7\u5148\u5728 YouTube \u64AD\u653E\u5668\u4E2D\u5F00\u542F\u5B57\u5E55\u3002"
+        );
+        return;
+      }
+      this.enabled = true;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.connectCaptionObserver();
+      this.scheduleCaptionRead();
+    }
+    disable() {
+      const wasEnabled = this.enabled;
+      this.enabled = false;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.observer?.disconnect();
+      this.observer = null;
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+        this.captionReadTimer = null;
+      }
+      if (wasEnabled) {
+        this.context.stopPlayback();
+      }
+    }
+    /** 仅当当前播放器公开可用的 CC 按钮时显示翻译入口。 */
+    hasAvailableCaptions() {
+      const button = document.querySelector(
+        ".ytp-subtitles-button"
+      );
+      return button !== null && !button.disabled && button.getAttribute("aria-disabled") !== "true";
+    }
+    /**
+     * 依次操作播放器的设置、字幕和自动翻译菜单。YouTube 没有公开字幕翻译 API，
+     * 因此这里使用可见菜单结构；标签匹配同时兼容中英文界面和全角/半角括号。
+     */
+    async selectSimplifiedChineseCaptions() {
+      try {
+        if (!isWatchPage(new URL(window.location.href))) {
+          throw new Error("\u8BF7\u5148\u6253\u5F00 YouTube \u89C6\u9891\u64AD\u653E\u9875\u3002");
+        }
+        const captionButton = document.querySelector(
+          ".ytp-subtitles-button"
+        );
+        if (captionButton === null || captionButton.disabled || captionButton.getAttribute("aria-disabled") === "true") {
+          throw new Error("\u5F53\u524D\u89C6\u9891\u6CA1\u6709\u53EF\u7528\u5B57\u5E55\u3002");
+        }
+        if (captionButton.getAttribute("aria-pressed") !== "true") {
+          captionButton.click();
+          await waitForCondition(
+            () => captionButton.getAttribute("aria-pressed") === "true",
+            "\u5B57\u5E55\u672A\u80FD\u5F00\u542F\uFF0C\u8BF7\u5148\u624B\u52A8\u70B9\u51FB\u64AD\u653E\u5668\u7684 CC \u6309\u94AE\u3002"
+          );
+        }
+        const settingsButton = document.querySelector(
+          ".ytp-settings-button"
+        );
+        if (settingsButton === null) {
+          throw new Error("\u6CA1\u6709\u627E\u5230 YouTube \u64AD\u653E\u5668\u8BBE\u7F6E\u6309\u94AE\u3002");
+        }
+        settingsButton.click();
+        const subtitleItem = await waitForMenuItem(
+          isSubtitleMenuLabel,
+          "\u8BBE\u7F6E\u83DC\u5355\u4E2D\u6CA1\u6709\u627E\u5230\u5B57\u5E55\u9009\u9879\u3002"
+        );
+        subtitleItem.click();
+        const subtitleChoices = await waitForValue(
+          () => {
+            const items = getVisibleMenuItems();
+            return items.some((item) => {
+              const label = getMenuItemLabel(item);
+              return isSimplifiedChineseLabel(label) || isAutoTranslateLabel(label);
+            }) ? items : null;
+          },
+          3e3
+        );
+        if (subtitleChoices === null) {
+          throw new Error("\u5B57\u5E55\u5217\u8868\u6CA1\u6709\u5C55\u5F00\uFF0C\u6216\u5176\u4E2D\u6CA1\u6709\u81EA\u52A8\u7FFB\u8BD1\u9009\u9879\u3002");
+        }
+        const directChineseItem = subtitleChoices.find(
+          (item) => isSimplifiedChineseLabel(getMenuItemLabel(item))
+        ) ?? null;
+        if (directChineseItem !== null) {
+          directChineseItem.click();
+          return;
+        }
+        const autoTranslateItem = subtitleChoices.find(
+          (item) => isAutoTranslateLabel(getMenuItemLabel(item))
+        );
+        if (!autoTranslateItem) {
+          throw new Error("\u5B57\u5E55\u83DC\u5355\u4E2D\u6CA1\u6709\u81EA\u52A8\u7FFB\u8BD1\u9009\u9879\u3002");
+        }
+        autoTranslateItem.click();
+        const simplifiedChineseItem = await waitForMenuItem(
+          isSimplifiedChineseLabel,
+          "\u81EA\u52A8\u7FFB\u8BD1\u8BED\u8A00\u5217\u8868\u4E2D\u6CA1\u6709\u627E\u5230\u4E2D\u6587\uFF08\u7B80\u4F53\uFF09\u3002",
+          true
+        );
+        simplifiedChineseItem.click();
+      } catch (error) {
+        this.report(
+          "YOUTUBE_SELECT_CHINESE_CAPTION_FAILED",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    handleNavigationStart = () => {
+      const wasEnabled = this.enabled;
+      this.enabled = false;
+      this.previousCaption = "";
+      this.pendingCaption = "";
+      this.captionSpeechActive = false;
+      this.observer?.disconnect();
+      this.observer = null;
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+        this.captionReadTimer = null;
+      }
+      if (wasEnabled) {
+        this.context.stopPlayback();
+      }
+    };
+    /** 字幕容器会随视频切换而销毁，因此每次启用或导航完成后重新建立观察器。 */
+    connectCaptionObserver() {
+      this.observer?.disconnect();
+      this.observer = null;
+      const captionContainer = document.querySelector(
+        ".ytp-caption-window-container"
+      );
+      if (captionContainer === null) {
+        return;
+      }
+      this.observer = new MutationObserver(() => this.scheduleCaptionRead());
+      this.observer.observe(captionContainer, {
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
+    }
+    /** 短延迟防抖可合并实时字幕的逐字符更新，避免每个字符都重启一次 TTS。 */
+    scheduleCaptionRead() {
+      if (!this.enabled) {
+        return;
+      }
+      if (this.captionReadTimer !== null) {
+        window.clearTimeout(this.captionReadTimer);
+      }
+      this.captionReadTimer = window.setTimeout(() => {
+        this.captionReadTimer = null;
+        this.readCurrentCaption();
+      }, 120);
+    }
+    readCurrentCaption() {
+      if (!this.enabled) {
+        return;
+      }
+      const video = document.querySelector("video.html5-main-video");
+      if (video?.paused === true || video?.ended === true) {
+        return;
+      }
+      const caption = Array.from(
+        document.querySelectorAll(CAPTION_SEGMENT_SELECTOR)
+      ).map((segment) => normalizeCaption(segment.textContent ?? "")).filter(Boolean).join(" ").trim();
+      if (!caption || caption === this.previousCaption) {
+        return;
+      }
+      const newText = removeRepeatedPrefix(this.previousCaption, caption);
+      this.previousCaption = caption;
+      if (newText) {
+        this.pendingCaption = appendCaption(this.pendingCaption, newText);
+        this.flushCaptionQueue();
+      }
+    }
+    /** 同一时刻只提交一个字幕话语；后续 DOM 更新先进入缓冲，等待 completed。 */
+    flushCaptionQueue() {
+      if (!this.enabled || this.captionSpeechActive || !this.pendingCaption) {
+        return;
+      }
+      const text = this.pendingCaption;
+      this.pendingCaption = "";
+      this.captionSpeechActive = true;
+      this.context.playCaption(text);
+    }
+    handlePlaybackState(state) {
+      if (state.source !== "caption") {
+        return;
+      }
+      if (state.status === "loading" || state.status === "playing" || state.status === "paused") {
+        this.captionSpeechActive = true;
+        return;
+      }
+      if (state.status === "completed") {
+        this.captionSpeechActive = false;
+        this.flushCaptionQueue();
+        return;
+      }
+      if (state.status === "stopped" || state.status === "error") {
+        this.enabled = false;
+        this.captionSpeechActive = false;
+        this.pendingCaption = "";
+      }
+    }
+    report(code, message) {
+      const error = {
+        code,
+        message,
+        source: "content",
+        recoverable: true
+      };
+      this.context.reportError(error);
+    }
+  };
+  function isYoutubeHost(hostname) {
+    return hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+  }
+  function isWatchPage(url) {
+    return isYoutubeHost(url.hostname) && url.pathname === "/watch";
+  }
+  function normalizeCaption(text) {
+    return text.replace(/\s+/gu, " ").trim();
+  }
+  function appendCaption(buffer, text) {
+    return buffer ? `${buffer} ${text}` : text;
+  }
+  function normalizeMenuLabel(text) {
+    return text.normalize("NFKC").toLowerCase().replace(/[\s\-_/]+/gu, "").trim();
+  }
+  function getMenuItemLabel(item) {
+    const label = item.querySelector(".ytp-menuitem-label");
+    return normalizeMenuLabel(label?.textContent ?? item.textContent ?? "");
+  }
+  function isSubtitleMenuLabel(label) {
+    return label.includes("\u5B57\u5E55") || label.includes("subtitles") || label.includes("captions");
+  }
+  function isAutoTranslateLabel(label) {
+    return label.includes("\u81EA\u52A8\u7FFB\u8BD1") || label.includes("autotranslate");
+  }
+  function isSimplifiedChineseLabel(label) {
+    const targets = /* @__PURE__ */ new Set([
+      "\u4E2D\u6587(\u7B80\u4F53)",
+      "\u7B80\u4F53\u4E2D\u6587",
+      "chinese(simplified)",
+      "chinese(simplifiedchinese)"
+    ]);
+    return targets.has(label);
+  }
+  function getVisibleMenuItems() {
+    const player = document.querySelector(".html5-video-player");
+    if (player === null) {
+      return [];
+    }
+    const candidates = Array.from(
+      player.querySelectorAll(
+        ".ytp-menuitem, [role='menuitem'], .ytp-menuitem-label"
+      )
+    );
+    const clickableItems = candidates.map(
+      (candidate) => candidate.closest(".ytp-menuitem, [role='menuitem']") ?? candidate
+    );
+    return Array.from(new Set(clickableItems)).filter((item) => {
+      const style = window.getComputedStyle(item);
+      const rect = item.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    });
+  }
+  async function waitForMenuItem(matches, errorMessage, scrollToEnd = false) {
+    const item = await waitForValue(
+      () => {
+        const matched = getVisibleMenuItems().find(
+          (candidate) => matches(getMenuItemLabel(candidate))
+        ) ?? null;
+        if (matched === null && scrollToEnd) {
+          scrollOpenMenuToEnd();
+        }
+        return matched;
+      },
+      3e3
+    );
+    if (item === null) {
+      throw new Error(errorMessage);
+    }
+    return item;
+  }
+  function scrollOpenMenuToEnd() {
+    const player = document.querySelector(".html5-video-player");
+    const panels = player === null ? [] : Array.from(
+      player.querySelectorAll(
+        ".ytp-panel-menu, [role='menu']"
+      )
+    );
+    for (const panel of panels) {
+      if (panel.scrollHeight > panel.clientHeight) {
+        panel.scrollTop = panel.scrollHeight;
+      }
+    }
+  }
+  async function waitForCondition(condition, errorMessage) {
+    const matched = await waitForValue(() => condition() ? true : null, 2e3);
+    if (matched === null) {
+      throw new Error(errorMessage);
+    }
+  }
+  async function waitForValue(read, timeout) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const value = read();
+      if (value !== null) {
+        return value;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
+    return read();
+  }
+  function removeRepeatedPrefix(previous, current) {
+    if (!previous) {
+      return current;
+    }
+    const maximumOverlap = Math.min(previous.length, current.length);
+    for (let length = maximumOverlap; length > 0; length -= 1) {
+      if (previous.slice(-length) === current.slice(0, length)) {
+        return current.slice(length).trim();
+      }
+    }
+    return current;
+  }
+
+  // src/content/site-tool-panel.ts
+  var SITE_INTEGRATIONS = [
+    endGfwSiteIntegration,
+    redditSiteIntegration,
+    youtubeSiteIntegration
+  ];
+  function resolveSiteIntegration(url, context) {
+    const integration = SITE_INTEGRATIONS.find(
+      (candidate) => candidate.matches(url)
+    );
+    return integration?.create(url, context) ?? null;
+  }
+
+  // src/content/text-filter.ts
+  function filterPageTextItems(items, filter) {
+    if (filter === null) {
+      return {
+        items: items.map((item, index) => ({ ...item, index })),
+        sourceIndexesByItemId: /* @__PURE__ */ new Map(),
+        removedRangesByItemId: /* @__PURE__ */ new Map()
+      };
+    }
+    const filteredItems = [];
+    const sourceIndexesByItemId = /* @__PURE__ */ new Map();
+    const removedRangesByItemId = /* @__PURE__ */ new Map();
+    for (const item of items) {
+      const result = filter.filter(item.text);
+      if (result === null) {
+        continue;
+      }
+      if (result.removedSourceRanges.length > 0) {
+        removedRangesByItemId.set(item.id, result.removedSourceRanges);
+      }
+      if (!result.text.trim()) {
+        continue;
+      }
+      filteredItems.push({
+        ...item,
+        text: result.text,
+        index: filteredItems.length,
+        ...result.postPlaybackDelayMs === void 0 ? {} : { postPlaybackDelayMs: result.postPlaybackDelayMs }
+      });
+      sourceIndexesByItemId.set(item.id, result.sourceCharacterIndexes);
+    }
+    return { items: filteredItems, sourceIndexesByItemId, removedRangesByItemId };
+  }
+
+  // src/content/sites/end-gfw-text-filter.ts
+  var ANNOUNCED_SKIP_KEYWORDS = [
+    "\u706B\u707E",
+    "\u6D88\u9632",
+    "\u8D77\u706B",
+    "\u6CE5\u77F3\u6D41",
+    "\u6D2A\u6C34",
+    "\u6D2A\u707E",
+    "\u584C\u65B9",
+    "\u65FA\u65FA",
+    "\u6B20\u85AA",
+    "\u8BA8\u85AA",
+    "\u62D6\u6B20",
+    "\u4E0A\u5B98\u6B63\u4E49",
+    "\u6E14\u730E\u9F50\u54E5",
+    "\u6076\u6027",
+    "\u4F24\u4EBA"
+  ];
+  var SILENT_SKIP_KEYWORDS = ["\u5F3A\u5978", "\u6027\u5C11\u6570", "lgbt"];
+  var REMOVE_TO_END_MARKERS = ["\u67E5\u770B\u539F\u6587", "\u5F15\u7528\u63A8\u6587"];
+  var QUOTED_SECTION_MARKERS = [
+    "\u7F51\u53CB\u70ED\u8BAE",
+    "\u7F51\u53CB\u8BC4\u8BBA",
+    "\u5F39\u5E55\u8BC4\u8BBA",
+    "\u7F51\u53CB\u7559\u8A00",
+    "\u7F51\u53CB\u5632\u8BBD",
+    "\u8BC4\u8BBA\u533A"
+  ];
+  var endGfwTextFilter = {
+    id: "end-gfw-text-filter",
+    matches: (url) => url.hostname === "end-gfw.com",
+    filter: filterEndGfwText
+  };
+  function filterEndGfwText(text) {
+    const cleaned = removePartialContent(text);
+    if (cleaned === null || !cleaned.text) {
+      return cleaned;
+    }
+    if (findFirstKeyword(cleaned.text, SILENT_SKIP_KEYWORDS) !== null) {
+      return createGeneratedResult("\u8DF3\u8FC7", text.length);
+    }
+    const announcedKeyword = findFirstKeyword(
+      cleaned.text,
+      ANNOUNCED_SKIP_KEYWORDS
+    );
+    if (announcedKeyword !== null) {
+      return createGeneratedResult(
+        `\u8DF3\u8FC7\uFF0C\u5173\u952E\u5B57\uFF1A${announcedKeyword}`,
+        text.length
+      );
+    }
+    return cleaned;
+  }
+  function findFirstKeyword(text, keywords) {
+    const comparableText = text.toLocaleLowerCase();
+    let firstKeyword = null;
+    let firstIndex = Number.POSITIVE_INFINITY;
+    for (const keyword of keywords) {
+      const index = comparableText.indexOf(keyword.toLocaleLowerCase());
+      if (index >= 0 && index < firstIndex) {
+        firstKeyword = keyword;
+        firstIndex = index;
+      }
+    }
+    return firstKeyword;
+  }
+  function createGeneratedResult(text, sourceLength) {
+    return {
+      text,
+      sourceCharacterIndexes: null,
+      postPlaybackDelayMs: 1e3,
+      removedSourceRanges: sourceLength > 0 ? [{ start: 0, end: sourceLength }] : []
+    };
+  }
+  function removePartialContent(text) {
+    const ranges = [];
+    collectUrlRanges(text, ranges);
+    collectCommentSectionRange(text, ranges);
+    const terminalIndex = findFirstMarkerIndex(text, REMOVE_TO_END_MARKERS);
+    if (terminalIndex >= 0) {
+      ranges.push({ start: terminalIndex, end: text.length });
+    }
+    if (ranges.length === 0) {
+      return {
+        text,
+        sourceCharacterIndexes: Array.from(text, (_character, index) => index),
+        removedSourceRanges: []
+      };
+    }
+    return rebuildWithoutRanges(text, mergeRanges(ranges));
+  }
+  function collectUrlRanges(text, ranges) {
+    const urlPattern = /https?:\/\/[^\s)\]}>，。、“”‘’；！？]+/giu;
+    for (const match of text.matchAll(urlPattern)) {
+      const start = match.index;
+      if (start === void 0) {
+        continue;
+      }
+      ranges.push({ start, end: start + match[0].length });
+    }
+  }
+  function collectCommentSectionRange(text, ranges) {
+    const candidates = QUOTED_SECTION_MARKERS.flatMap((marker) => findAllMarkerIndexes(text, marker)).sort((first, second) => first - second);
+    const terminalIndex = findFirstMarkerIndex(text, REMOVE_TO_END_MARKERS);
+    for (const markerIndex of candidates) {
+      const searchEnd = Math.min(
+        text.length,
+        terminalIndex >= 0 ? terminalIndex : markerIndex + 80,
+        markerIndex + 80
+      );
+      if (!hasOpeningQuote(text, markerIndex, searchEnd)) {
+        continue;
+      }
+      ranges.push({
+        start: findCommentSectionStart(text, markerIndex),
+        end: text.length
+      });
+      return;
+    }
+  }
+  function findAllMarkerIndexes(text, marker) {
+    const indexes = [];
+    let searchFrom = 0;
+    while (searchFrom < text.length) {
+      const index = text.indexOf(marker, searchFrom);
+      if (index < 0) {
+        break;
+      }
+      indexes.push(index);
+      searchFrom = index + marker.length;
+    }
+    return indexes;
+  }
+  function hasOpeningQuote(text, start, end) {
+    for (let index = start; index < end; index += 1) {
+      if (isOpeningQuote(text[index])) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function isOpeningQuote(character) {
+    return character === "\u201C" || character === "\u2018" || character === '"' || character === "'";
+  }
+  function findCommentSectionStart(text, markerIndex) {
+    const minimumIndex = Math.max(0, markerIndex - 40);
+    for (let index = markerIndex - 1; index >= minimumIndex; index -= 1) {
+      if (/[。！？!?]/u.test(text[index] ?? "")) {
+        let sectionStart = index + 1;
+        while (sectionStart < markerIndex && /\s/u.test(text[sectionStart] ?? "")) {
+          sectionStart += 1;
+        }
+        return sectionStart;
+      }
+    }
+    return markerIndex;
+  }
+  function findFirstMarkerIndex(text, markers) {
+    let firstIndex = Number.POSITIVE_INFINITY;
+    for (const marker of markers) {
+      const index = text.indexOf(marker);
+      if (index >= 0 && index < firstIndex) {
+        firstIndex = index;
+      }
+    }
+    return Number.isFinite(firstIndex) ? firstIndex : -1;
+  }
+  function mergeRanges(ranges) {
+    const sorted = [...ranges].map((range) => ({
+      start: Math.max(0, range.start),
+      end: Math.min(range.end, Number.MAX_SAFE_INTEGER)
+    })).filter((range) => range.end > range.start).sort((first, second) => first.start - second.start);
+    const merged = [];
+    for (const range of sorted) {
+      const previous = merged.at(-1);
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        merged.push({ ...range });
+      }
+    }
+    return merged;
+  }
+  function rebuildWithoutRanges(text, ranges) {
+    const characters = [];
+    const indexes = [];
+    let rangeIndex = 0;
+    for (let sourceIndex = 0; sourceIndex < text.length; sourceIndex += 1) {
+      while (rangeIndex < ranges.length && sourceIndex >= (ranges[rangeIndex]?.end ?? Number.POSITIVE_INFINITY)) {
+        rangeIndex += 1;
+      }
+      const range = ranges[rangeIndex];
+      if (range && sourceIndex >= range.start && sourceIndex < range.end) {
+        continue;
+      }
+      const character = text[sourceIndex] ?? "";
+      if (/\s/u.test(character)) {
+        if (characters.length === 0 || characters.at(-1) === " ") {
+          continue;
+        }
+        characters.push(" ");
+        indexes.push(sourceIndex);
+      } else {
+        characters.push(character);
+        indexes.push(sourceIndex);
+      }
+    }
+    if (characters.at(-1) === " ") {
+      characters.pop();
+      indexes.pop();
+    }
+    const additionallyRemovedIndexes = [];
+    removeEmptySymbolPairs(characters, indexes, additionallyRemovedIndexes);
+    removeTrailingOrphanSymbols(characters, indexes, additionallyRemovedIndexes);
+    if (!/[\p{L}\p{N}]/u.test(characters.join(""))) {
+      return {
+        text: "",
+        sourceCharacterIndexes: [],
+        removedSourceRanges: text.length > 0 ? [{ start: 0, end: text.length }] : []
+      };
+    }
+    const allRemovedRanges = mergeRanges([
+      ...ranges,
+      ...additionallyRemovedIndexes.map((sourceIndex) => ({
+        start: sourceIndex,
+        end: sourceIndex + 1
+      }))
+    ]);
+    return {
+      text: characters.join(""),
+      sourceCharacterIndexes: indexes,
+      removedSourceRanges: allRemovedRanges
+    };
+  }
+  function removeEmptySymbolPairs(characters, indexes, removedIndexes) {
+    const closingByOpening = /* @__PURE__ */ new Map([
+      ["(", ")"],
+      ["\uFF08", "\uFF09"],
+      ["[", "]"],
+      ["\u3010", "\u3011"],
+      ["{", "}"],
+      ["<", ">"],
+      ["\u300A", "\u300B"]
+    ]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let index = 0; index < characters.length; index += 1) {
+        const expectedClosing = closingByOpening.get(characters[index] ?? "");
+        if (!expectedClosing) {
+          continue;
+        }
+        const possibleSpaceIndex = index + 1;
+        const closingIndex = characters[possibleSpaceIndex] === " " ? possibleSpaceIndex + 1 : possibleSpaceIndex;
+        if (characters[closingIndex] !== expectedClosing) {
+          continue;
+        }
+        for (let removeIndex = closingIndex; removeIndex >= index; removeIndex -= 1) {
+          const sourceIndex = indexes[removeIndex];
+          if (sourceIndex !== void 0) {
+            removedIndexes.push(sourceIndex);
+          }
+          characters.splice(removeIndex, 1);
+          indexes.splice(removeIndex, 1);
+        }
+        changed = true;
+        break;
+      }
+    }
+  }
+  function removeTrailingOrphanSymbols(characters, indexes, removedIndexes) {
+    const orphanPattern = /[\s[【(（{<《：:,，、;；\-—|/\\]/u;
+    while (characters.length > 0 && orphanPattern.test(characters.at(-1) ?? "")) {
+      const sourceIndex = indexes.pop();
+      characters.pop();
+      if (sourceIndex !== void 0) {
+        removedIndexes.push(sourceIndex);
+      }
+    }
+  }
+
+  // src/content/text-filter-registry.ts
+  function resolveSiteTextFilter(url) {
+    const filters = [endGfwTextFilter];
+    return filters.find((filter) => filter.matches(url)) ?? null;
+  }
+
+  // src/content/content-script.ts
+  function isSupportedPage(url) {
+    return url.protocol === "http:" || url.protocol === "https:";
+  }
+  function hasValidExtensionContext() {
+    try {
+      return typeof chrome.runtime.id === "string" && chrome.runtime.id.length > 0;
+    } catch {
+      return false;
+    }
+  }
+  async function sendRequest(request) {
+    if (!hasValidExtensionContext()) {
+      throw new Error("\u6269\u5C55\u5DF2\u91CD\u65B0\u52A0\u8F7D\uFF0C\u8BF7\u5237\u65B0\u5F53\u524D\u9875\u9762\u3002");
+    }
+    const response = await chrome.runtime.sendMessage(
+      request
+    );
+    if (!response.ok) {
+      throw new Error(response.error);
+    }
+    return response.state;
+  }
+  var initialPageUrl = new URL(window.location.href);
+  if (isSupportedPage(initialPageUrl)) {
+    initializePagePlayback(
+      resolvePageAdapter(initialPageUrl),
+      resolveSiteTextFilter(initialPageUrl)
+    );
+  }
+  function initializePagePlayback(defaultAdapter, textFilter) {
+    let pageSessionId = crypto.randomUUID();
+    const errorFeedback = new ErrorFeedback();
+    const visibleTextAdapter = new VisibleTextAdapter();
+    const contentScope = resolveSiteContentScope(initialPageUrl);
+    let activeAdapter = defaultAdapter;
+    let sourceIndexesByItemId = /* @__PURE__ */ new Map();
+    const adapterProxy = {
+      id: "active-adapter-proxy",
+      priority: 0,
+      matches: (url) => activeAdapter.matches(url),
+      scanTextItems: () => activeAdapter.scanTextItems(),
+      getQueueContextId: () => activeAdapter.getQueueContextId?.() ?? activeAdapter.id,
+      findTextElement: (itemId) => activeAdapter.findTextElement(itemId),
+      getHighlightTextColor: (itemId) => activeAdapter.getHighlightTextColor?.(itemId) ?? null,
+      getTextElementCharOffset: (itemId) => activeAdapter.getTextElementCharOffset?.(itemId) ?? 0,
+      resolveTextDomPosition: (itemId, charIndex) => {
+        if (sourceIndexesByItemId.has(itemId)) {
+          const sourceIndexes = sourceIndexesByItemId.get(itemId) ?? null;
+          if (sourceIndexes === null || sourceIndexes.length === 0) {
+            return null;
+          }
+          const boundedIndex = Math.min(
+            sourceIndexes.length - 1,
+            Math.max(0, Math.trunc(charIndex))
+          );
+          const sourceCharIndex = sourceIndexes[boundedIndex];
+          if (sourceCharIndex === void 0) {
+            return null;
+          }
+          if (activeAdapter.resolveTextDomPosition) {
+            return activeAdapter.resolveTextDomPosition(itemId, sourceCharIndex);
+          }
+          const element2 = activeAdapter.findTextElement(itemId);
+          return element2 ? { element: element2, charIndex: sourceCharIndex } : null;
+        }
+        if (activeAdapter.resolveTextDomPosition) {
+          return activeAdapter.resolveTextDomPosition(itemId, charIndex);
+        }
+        const element = activeAdapter.findTextElement(itemId);
+        return element ? { element, charIndex } : null;
+      },
+      findSelectionPosition: (selection) => {
+        const position = activeAdapter.findSelectionPosition(selection);
+        if (!position || !sourceIndexesByItemId.has(position.itemId)) {
+          return position;
+        }
+        const sourceIndexes = sourceIndexesByItemId.get(position.itemId) ?? null;
+        if (sourceIndexes === null || sourceIndexes.length === 0) {
+          return { ...position, charIndex: 0 };
+        }
+        const filteredIndex = sourceIndexes.findIndex(
+          (sourceIndex) => sourceIndex >= position.charIndex
+        );
+        return {
+          ...position,
+          charIndex: filteredIndex >= 0 ? filteredIndex : Math.max(0, sourceIndexes.length - 1)
+        };
+      }
+    };
+    const highlighter = new PageHighlighter(adapterProxy);
+    const filteredTextDecorator = new FilteredTextDecorator(adapterProxy);
+    const selectionJumpPrompt = new SelectionJumpPrompt((position) => {
+      void executePageCommand({
+        type: "page:play-from-position",
+        itemId: position.itemId,
+        charIndex: position.charIndex
+      });
+    });
+    let items = [];
+    let currentItemId = null;
+    let lastSelectedText = "";
+    let lastAutoSelectionText = "";
+    let selectionTimer = null;
+    let scanTimer = null;
+    let hasRegisteredPageSession = false;
+    let activeQueueContextId = null;
+    let settings = { ...DEFAULT_SETTINGS };
+    let latestState = {
+      status: "idle",
+      source: null,
+      itemId: null,
+      updatedAt: Date.now()
+    };
+    let keepAlivePort = null;
+    let keepAliveTimer = null;
+    const sitePlaybackStateListeners = /* @__PURE__ */ new Set();
+    const siteIntegration = resolveSiteIntegration(new URL(window.location.href), {
+      getCurrentTextElement: () => currentItemId === null ? null : activeAdapter.findTextElement(currentItemId),
+      reportError: (error) => showError(error),
+      showNotice: (message) => errorFeedback.showNotice(message),
+      playCaption: (text) => {
+        void executePlayerRequest({ type: "site:play-caption", text });
+      },
+      stopPlayback: () => {
+        void executePlayerRequest({ type: "player:stop" });
+      },
+      subscribePlaybackState: (listener) => {
+        sitePlaybackStateListeners.add(listener);
+        return () => sitePlaybackStateListeners.delete(listener);
+      }
+    });
+    const controlBar = new FloatingControlBar({
+      onTogglePlayback() {
+        void executePageCommand({ type: "page:toggle" });
+      },
+      onPrevious() {
+        void executePageCommand({ type: "page:previous" });
+      },
+      onNext() {
+        void executePageCommand({ type: "page:next" });
+      },
+      onPlaySelection() {
+        const text = getSelectedText() || lastSelectedText;
+        if (!text) {
+          showError({
+            code: "NO_SELECTED_TEXT",
+            message: "\u8BF7\u5148\u9009\u62E9\u7F51\u9875\u6587\u672C\u3002",
+            source: "content",
+            recoverable: true
+          });
+          return;
+        }
+        void executePlayerRequest({
+          type: "player:play-text",
+          text,
+          source: "selection"
+        });
+      },
+      onPlayText(text) {
+        void executePlayerRequest({
+          type: "player:play-text",
+          text,
+          source: "input"
+        });
+      }
+    }, siteIntegration?.toolPanel ?? null, siteIntegration?.startExpanded ?? false);
+    siteIntegration?.start?.();
+    window.addEventListener("pagehide", () => siteIntegration?.stop?.(), {
+      once: true
+    });
+    async function executePlayerRequest(request) {
+      try {
+        renderPlaybackState(await sendRequest(request));
+      } catch (error) {
+        showError(createContentError("PLAYER_REQUEST_FAILED", error));
+      }
+    }
+    async function executePageCommand(request) {
+      try {
+        await sendRequest({ type: "page:set-items", items, pageSessionId });
+        renderPlaybackState(await sendRequest(request));
+      } catch (error) {
+        showError(createContentError("PAGE_COMMAND_FAILED", error));
+      }
+    }
+    function renderPlaybackState(state) {
+      latestState = state;
+      for (const listener of sitePlaybackStateListeners) {
+        listener(state);
+      }
+      updatePlayerKeepAlive(state);
+      controlBar.renderState(state);
+      if (!settings.globalEnabled) {
+        highlighter.clear();
+        return;
+      }
+      if (state.source === "page" && state.itemId) {
+        currentItemId = state.itemId;
+        if (state.status === "loading" || state.status === "playing" || state.status === "paused") {
+          highlighter.highlight(state.itemId);
+        } else {
+          highlighter.clear();
+        }
+        renderNavigation();
+      }
+      if (state.status === "error" && state.errorMessage) {
+        showError({
+          code: "TTS_PLAYBACK_ERROR",
+          message: state.errorMessage,
+          source: "tts",
+          recoverable: true
+        });
+      }
+    }
+    async function applyGlobalActivation(nextSettings) {
+      controlBar.setGlobalEnabled(nextSettings.globalEnabled);
+      if (nextSettings.globalEnabled) {
+        return;
+      }
+      selectionJumpPrompt.hide();
+      highlighter.clear();
+      if (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused") {
+        renderPlaybackState(await sendRequest({ type: "player:stop" }));
+      }
+    }
+    async function applyRuntimeSettings(nextSettings) {
+      highlighter.renderColors(
+        nextSettings.highlightBorderColor,
+        nextSettings.highlightBackgroundColor
+      );
+      await applyGlobalActivation(nextSettings);
+      await applyTextScanMode(nextSettings);
+    }
+    function updatePlayerKeepAlive(state) {
+      const shouldKeepAlive = state.status === "loading" || state.status === "playing" || state.status === "paused";
+      if (!shouldKeepAlive) {
+        stopPlayerKeepAlive();
+        return;
+      }
+      if (keepAlivePort !== null) {
+        return;
+      }
+      if (!hasValidExtensionContext()) {
+        stopPlayerKeepAlive();
+        return;
+      }
+      try {
+        keepAlivePort = chrome.runtime.connect({ name: "player-keep-alive" });
+      } catch {
+        keepAlivePort = null;
+        stopPlayerKeepAlive();
+        return;
+      }
+      keepAlivePort.onDisconnect.addListener(() => {
+        keepAlivePort = null;
+        if (keepAliveTimer !== null) {
+          window.clearInterval(keepAliveTimer);
+          keepAliveTimer = null;
+        }
+        if (hasValidExtensionContext() && (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused")) {
+          window.setTimeout(() => updatePlayerKeepAlive(latestState), 500);
+        }
+      });
+      keepAliveTimer = window.setInterval(() => {
+        try {
+          keepAlivePort?.postMessage({ type: "player:keep-alive" });
+        } catch {
+        }
+      }, 2e4);
+    }
+    function stopPlayerKeepAlive() {
+      if (keepAliveTimer !== null) {
+        window.clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+      }
+      const port = keepAlivePort;
+      keepAlivePort = null;
+      try {
+        port?.disconnect();
+      } catch {
+      }
+    }
+    function renderNavigation() {
+      const currentIndex = currentItemId ? items.findIndex((item) => item.id === currentItemId) : 0;
+      controlBar.renderNavigation(Math.max(currentIndex, 0), items.length);
+    }
+    async function scanPage() {
+      const scanningAdapter = activeAdapter;
+      const scopedItems = applySiteContentScope(
+        scanningAdapter.scanTextItems(),
+        scanningAdapter,
+        contentScope
+      );
+      const filteredScan = filterPageTextItems(
+        scopedItems,
+        textFilter
+      );
+      const nextItems = filteredScan.items;
+      if (scanningAdapter !== activeAdapter) {
+        return;
+      }
+      const nextQueueContextId = scanningAdapter.getQueueContextId?.() ?? scanningAdapter.id;
+      const queueContextChanged = activeQueueContextId !== null && activeQueueContextId !== nextQueueContextId;
+      activeQueueContextId = nextQueueContextId;
+      if (queueContextChanged) {
+        pageSessionId = crypto.randomUUID();
+        if (latestState.source === "page" && (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused")) {
+          renderPlaybackState(await sendRequest({ type: "player:stop" }));
+        }
+        highlighter.clear();
+        items = [];
+        sourceIndexesByItemId = /* @__PURE__ */ new Map();
+        currentItemId = null;
+        hasRegisteredPageSession = false;
+        renderNavigation();
+      }
+      sourceIndexesByItemId = filteredScan.sourceIndexesByItemId;
+      filteredTextDecorator.render(filteredScan.removedRangesByItemId);
+      const previousSignature = items.map(
+        (item) => `${item.id}:${item.text}:${item.postPlaybackDelayMs ?? 0}`
+      ).join("|");
+      const nextSignature = nextItems.map(
+        (item) => `${item.id}:${item.text}:${item.postPlaybackDelayMs ?? 0}`
+      ).join("|");
+      items = nextItems;
+      highlighter.refresh();
+      renderNavigation();
+      if (!hasRegisteredPageSession || previousSignature !== nextSignature) {
+        await executePlayerRequest({
+          type: "page:set-items",
+          items,
+          pageSessionId
+        });
+        hasRegisteredPageSession = true;
+      }
+    }
+    async function applyTextScanMode(nextSettings) {
+      const nextAdapter = nextSettings.playAllVisibleText ? visibleTextAdapter : defaultAdapter;
+      if (nextAdapter === activeAdapter) {
+        return;
+      }
+      if (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused") {
+        renderPlaybackState(await sendRequest({ type: "player:stop" }));
+      }
+      highlighter.clear();
+      selectionJumpPrompt.hide();
+      activeAdapter = nextAdapter;
+      activeQueueContextId = null;
+      items = [];
+      sourceIndexesByItemId = /* @__PURE__ */ new Map();
+      currentItemId = null;
+      renderNavigation();
+      await scanPage();
+    }
+    function scheduleSelectionAutoPlay(event) {
+      if (!settings.globalEnabled) {
+        selectionJumpPrompt.hide();
+        return;
+      }
+      const target = event.target;
+      if (target instanceof Element && target.closest(
+        "#chrome-tts-floating-control-bar, #chrome-tts-error-feedback, #chrome-tts-selection-jump-prompt, #chrome-tts-collapsed-launcher"
+      )) {
+        return;
+      }
+      const capturedText = getSelectedText();
+      const selection = window.getSelection();
+      const selectionPosition = selection ? activeAdapter.findSelectionPosition(selection) : null;
+      const selectionRect = getSelectionRect(selection);
+      if (capturedText) {
+        lastSelectedText = capturedText;
+      }
+      if (selectionTimer !== null) {
+        window.clearTimeout(selectionTimer);
+      }
+      selectionTimer = window.setTimeout(() => {
+        selectionTimer = null;
+        if (settings.showSelectionJumpPrompt && selectionPosition && selectionRect) {
+          selectionJumpPrompt.show(selectionRect, selectionPosition);
+        } else {
+          selectionJumpPrompt.hide();
+        }
+        void autoPlayCurrentSelection(capturedText);
+      }, 150);
+    }
+    async function autoPlayCurrentSelection(capturedText) {
+      const text = capturedText || getSelectedText();
+      if (!text) {
+        lastAutoSelectionText = "";
+        return;
+      }
+      lastSelectedText = text;
+      if (!settings.autoPlaySelection || text === lastAutoSelectionText) {
+        return;
+      }
+      if (latestState.status === "loading" || latestState.status === "playing" || latestState.status === "paused") {
+        return;
+      }
+      lastAutoSelectionText = text;
+      await executePlayerRequest({ type: "selection:auto-play", text });
+    }
+    function showError(error) {
+      errorFeedback.show(error);
+    }
+    document.addEventListener("selectionchange", () => {
+      const selection = getSelectedText();
+      if (selection) {
+        lastSelectedText = selection;
+      }
+    });
+    document.addEventListener("pointerup", scheduleSelectionAutoPlay);
+    document.addEventListener("keyup", scheduleSelectionAutoPlay);
+    chrome.runtime.onMessage.addListener((message) => {
+      if (typeof message !== "object" || message === null || !("type" in message)) {
+        return;
+      }
+      const event = message;
+      if (event.type === "player:state-changed") {
+        renderPlaybackState(event.state);
+      } else if (event.type === "player:position-changed") {
+        highlighter.highlightPosition(
+          event.position.itemId,
+          event.position.charIndex,
+          event.position.length
+        );
+      } else if (event.type === "extension:error") {
+        showError(event.error);
+      }
+    });
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === "local" && SETTINGS_KEY in changes) {
+        void loadSettings().then((nextSettings) => {
+          settings = nextSettings;
+          if (!nextSettings.showSelectionJumpPrompt) {
+            selectionJumpPrompt.hide();
+          }
+          void applyRuntimeSettings(nextSettings).catch((error) => {
+            showError(createContentError("APPLY_SETTINGS_FAILED", error));
+          });
+        }).catch((error) => {
+          showError(createContentError("LOAD_SETTINGS_FAILED", error));
+        });
+      }
+    });
+    const observer = new MutationObserver(() => {
+      if (scanTimer !== null) {
+        window.clearTimeout(scanTimer);
+      }
+      scanTimer = window.setTimeout(() => {
+        scanTimer = null;
+        void scanPage().catch((error) => {
+          showError(createContentError("PAGE_SCAN_FAILED", error));
+        });
+      }, 300);
+    });
+    observer.observe(document.body, {
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+    void loadSettings().then((loadedSettings) => {
+      settings = loadedSettings;
+      return applyRuntimeSettings(loadedSettings);
+    }).catch((error) => {
+      showError(createContentError("LOAD_SETTINGS_FAILED", error));
+    });
+    void scanPage().then(() => executePlayerRequest({ type: "player:get-state" })).catch((error) => {
+      showError(createContentError("PAGE_SCAN_FAILED", error));
+    });
+  }
+  function getSelectedText() {
+    return window.getSelection()?.toString().replace(/\s+/g, " ").trim() ?? "";
+  }
+  function getSelectionRect(selection) {
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null;
+    }
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (rect.width > 0 || rect.height > 0) {
+      return rect;
+    }
+    return range.getClientRects()[0] ?? null;
+  }
+  function getErrorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  function createContentError(code, error) {
+    return {
+      code,
+      message: getErrorMessage(error),
+      source: "content",
+      recoverable: true
+    };
+  }
+})();
