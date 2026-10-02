@@ -7,6 +7,9 @@ import type {
 
 /** 设置页和 content script 可以发送给 service worker 的播放器命令。 */
 export type ExtensionRequest =
+  | { type: "end-gfw:get-webhook" }
+  | { type: "end-gfw:save-webhook"; url: string }
+  | { type: "end-gfw:push-tweet"; tweetId: string; url: string; time: string }
   | { type: "page:set-items"; items: PageTextItem[]; pageSessionId: string }
   | { type: "page:toggle" }
   | { type: "page:previous" }
@@ -28,7 +31,7 @@ export type ExtensionEvent =
 
 /** 播放器命令的统一响应，避免调用方分别猜测错误返回结构。 */
 export type ExtensionResponse =
-  | { ok: true; state: PlaybackState }
+  | { ok: true; state: PlaybackState; webhookUrl?: string }
   | { ok: false; state: PlaybackState; error: string };
 
 /**
@@ -41,6 +44,15 @@ export function isExtensionRequest(value: unknown): value is ExtensionRequest {
   }
 
   const type = value.type;
+  if (type === "end-gfw:get-webhook") return true;
+  if (type === "end-gfw:save-webhook") {
+    return "url" in value && typeof value.url === "string" && value.url.length <= 2048;
+  }
+  if (type === "end-gfw:push-tweet") {
+    return "url" in value && typeof value.url === "string" && value.url.length <= 2048 &&
+      "tweetId" in value && typeof value.tweetId === "string" && /^\d{1,30}$/u.test(value.tweetId) &&
+      "time" in value && isEndGfwTweetTime(value.time);
+  }
   if (type === "page:set-items") {
     return (
       "items" in value &&
@@ -131,6 +143,14 @@ function isPageTextItemArray(value: unknown): value is PageTextItem[] {
         item.index >= 0,
     )
   );
+}
+
+/** 使用 UTC 仅验证真实日期，保留卡片时间，不作时区换算。 */
+export function isEndGfwTweetTime(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)) return false;
+  const iso = value.replace(" ", "T") + ".000Z";
+  const date = new Date(iso);
+  return Number.isFinite(date.getTime()) && date.toISOString() === iso;
 }
 
 function isSpeakableText(text: string): boolean {

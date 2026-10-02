@@ -1,5 +1,5 @@
 import type { ExtensionError } from "../../shared/models";
-import type { ExtensionResponse } from "../../shared/messages";
+import { isEndGfwTweetTime, type ExtensionRequest, type ExtensionResponse } from "../../shared/messages";
 import type {
   SiteIntegration,
   SiteIntegrationContext,
@@ -18,7 +18,8 @@ const END_GFW_TWEET_SELECTOR =
 /** End GFW 的全部特殊行为集中于此，注册入口只负责匹配和调度。 */
 export const endGfwSiteIntegration: SiteIntegration = {
   id: "end-gfw",
-  matches: (url) => url.hostname === "end-gfw.com",
+  // 旧站已迁移到 v1 子域名，同时保留原域名入口。
+  matches: (url) => ["end-gfw.com", "v1.end-gfw.com"].includes(url.hostname),
   create(url, context) {
     const toolPanel = createTweetPageToolPanel(url, context);
     return {
@@ -43,6 +44,16 @@ function createTweetPageToolPanel(
     title: "End GFW 工具",
     actions: [
       {
+        id: "push-tweet",
+        label: "推送至Discord",
+        description: "将当前推文时间、ID 和原始链接发送到 Discord",
+        activate: () => {
+          void pushCurrentTweet(context).catch((error: unknown) => {
+            context.reportError({ ...createSiteToolError("PUSH_TWEET_FAILED", error), requiresConfirmation: true });
+          });
+        },
+      },
+      {
         id: "open-x-tweet",
         label: "跳转 X",
         description: "在新标签页打开当前播放或当前可见的推文",
@@ -59,6 +70,16 @@ function createTweetPageToolPanel(
         activate: () => {
           void copyCurrentTweetId(context).catch((error: unknown) => {
             context.reportError(createSiteToolError("COPY_TWEET_ID_FAILED", error));
+          });
+        },
+      },
+      {
+        id: "configure-tweet-webhook",
+        label: "设置 Webhook",
+        description: "保存推文推送的 Discord Webhook，留空保存可清除",
+        activate: () => {
+          void configureTweetWebhook(context).catch((error: unknown) => {
+            context.reportError(createSiteToolError("SAVE_WEBHOOK_FAILED", error));
           });
         },
       },
@@ -135,17 +156,68 @@ async function openCurrentTweetOnX(
   }
 }
 
-/** 复制和跳转共用同一套定位规则，确保两个按钮针对同一条推文。 */
-function getCurrentTweetId(context: SiteIntegrationContext): string {
+/** 复制、跳转和推送共享文章定位，保持当前播放优先、视口中心兜底。 */
+function getCurrentTweetArticle(context: SiteIntegrationContext): HTMLElement {
   const currentArticle = context
     .getCurrentTextElement()
     ?.closest<HTMLElement>(END_GFW_TWEET_SELECTOR);
   const article = currentArticle ?? findNearestVisibleTweet();
+  if (!article) throw new Error("当前页面没有可识别的推文。");
+  return article;
+}
+
+function getCurrentTweetId(context: SiteIntegrationContext): string {
+  const article = getCurrentTweetArticle(context);
   const tweetId = article?.id.trim() ?? "";
   if (!/^\d+$/u.test(tweetId)) {
     throw new Error("当前页面没有可提取的推文 ID。");
   }
   return tweetId;
+}
+
+/** 回填已有链接；取消不修改，空字符串保存表示清除。 */
+async function configureTweetWebhook(context: SiteIntegrationContext): Promise<void> {
+  const current = await sendWebhookRequest({ type: "end-gfw:get-webhook" });
+  const url = window.prompt("请输入推文推送的 Discord Webhook。留空并确定可清除；取消保留原配置。", current.webhookUrl ?? "");
+  if (url === null) return;
+  await sendWebhookRequest({ type: "end-gfw:save-webhook", url: url.trim() });
+  context.showNotice(url.trim() ? "Webhook 已保存，浏览器重启后仍有效。" : "Webhook 已清除。");
+}
+
+/** 旧页面时间来自 time[datetime]；原文链接须对应当前 ID，不能误取引用推文。 */
+async function pushCurrentTweet(context: SiteIntegrationContext): Promise<void> {
+  const article = getCurrentTweetArticle(context);
+  const tweetId = article.id.trim();
+  if (!/^\d{1,30}$/u.test(tweetId)) throw new Error("当前页面没有可提取的推文 ID。");
+  const timeElement = article.querySelector("time[datetime]");
+  const time = timeElement?.getAttribute("datetime")?.trim().replace("T", " ") ?? "";
+  if (!isEndGfwTweetTime(time)) throw new Error("当前推文卡片中没有有效时间，无法推送。");
+  let url = "";
+  for (const link of Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href*="/status/"]'))) {
+    const target = new URL(link.href, window.location.href);
+    if (target.protocol === "https:" && ["x.com", "www.x.com"].includes(target.hostname) &&
+        /^\/[^/]+\/status\/(\d+)\/?$/u.exec(target.pathname)?.[1] === tweetId) {
+      url = target.href;
+      break;
+    }
+  }
+  // 旧卡片可能没有原文超链接，此时由页面已有作者参数和文章 ID 还原原始地址。
+  if (!url) {
+    const author = new URL(window.location.href).searchParams.get("id") ?? "";
+    if (!/^[A-Za-z0-9_]{1,15}$/u.test(author)) throw new Error("无法识别推文作者，无法生成原始链接。");
+    url = `https://x.com/${author}/status/${tweetId}`;
+  }
+  await sendWebhookRequest({ type: "end-gfw:push-tweet", tweetId, url, time });
+  context.showNotice(`推送成功，ID：${tweetId}`);
+}
+
+/** 消息失败仅显示安全文案，不把 Webhook 写入日志。 */
+async function sendWebhookRequest(request: ExtensionRequest): Promise<Extract<ExtensionResponse, { ok: true }>> {
+  let response: ExtensionResponse;
+  try { response = await chrome.runtime.sendMessage(request) as ExtensionResponse; }
+  catch { throw new Error("无法连接扩展后台，请重新加载扩展并刷新页面。"); }
+  if (!response?.ok) throw new Error(response?.error ?? "推文推送操作失败。");
+  return response;
 }
 
 function findNearestVisibleTweet(): HTMLElement | null {

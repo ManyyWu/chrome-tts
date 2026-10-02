@@ -20,6 +20,7 @@ export interface SiteToolAction {
 export interface SiteIntegrationContext {
   getCurrentTextElement(): HTMLElement | null;
   reportError(error: ExtensionError): void;
+  showNotice(message: string): void;
   playCaption(text: string): void;
   stopPlayback(): void;
   subscribePlaybackState(listener: (state: PlaybackState) => void): () => void;

@@ -11,6 +11,7 @@ import type {
   PlaybackState,
 } from "../shared/models";
 import { loadSettings } from "../shared/settings";
+import { handleEndGfwWebhook } from "./end-gfw-webhook";
 import { TtsPlayer, type SpeechSnapshot } from "./player";
 
 interface PageQueue {
@@ -154,6 +155,14 @@ async function handleRequest(
   sender: chrome.runtime.MessageSender,
 ): Promise<ExtensionResponse> {
   switch (request.type) {
+    case "end-gfw:get-webhook": {
+      const webhookUrl = await handleEndGfwWebhook(request, sender);
+      return { ok: true, state: player.getState(), webhookUrl: webhookUrl ?? "" };
+    }
+    case "end-gfw:save-webhook":
+    case "end-gfw:push-tweet":
+      await handleEndGfwWebhook(request, sender);
+      return { ok: true, state: player.getState() };
     case "page:set-items": {
       const tabId = requireSenderTabId(sender);
       await updatePageQueue(tabId, request.items, request.pageSessionId);

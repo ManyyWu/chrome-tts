@@ -119,6 +119,7 @@ function initializePagePlayback(defaultAdapter: PageAdapter): void {
         ? null
         : activeAdapter.findTextElement(currentItemId),
     reportError: (error) => showError(error),
+    showNotice: (message) => errorFeedback.showNotice(message),
     playCaption: (text) => {
       void executePlayerRequest({ type: "site:play-caption", text });
     },

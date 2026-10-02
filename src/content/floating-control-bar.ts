@@ -826,7 +826,8 @@ export class FloatingControlBar {
         background: #f1f3f4;
         cursor: pointer;
         font: 600 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        text-align: left;
+        text-align: center;
+        white-space: nowrap;
       }
 
       .site-tool-action:hover {
